@@ -1,0 +1,6 @@
+3100;Fremdleistungen;Dienstleistungen von anderen Unternehmen, Subunternehmern oder Freelancern.
+4600;Werbekosten;Anzeigen, Flyer, Grafikdesign, Texterstellung, Marketingagenturen, Google Ads.
+4650;Bewirtungskosten;Kaffee fürs Büro, Kekse, Mitarbeiterverpflegung, Kundenbewirtung.
+4920;Telefon;Mobilfunkverträge, Festnetzanschlüsse, Internetgebühren.
+4930;Bürobedarf;Schreibwaren, Ordner, Kopierpapier, Locher, Stifte.
+4940;Zeitschriften, Bücher;Fachliteratur, Gesetzestexte, steuerrechtliche Kommentare.

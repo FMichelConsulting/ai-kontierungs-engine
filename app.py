@@ -3,7 +3,10 @@ import xml.etree.ElementTree as ET
 import json
 import pandas as pd
 import io
+import os
 from openai import OpenAI
+from pypdf import PdfReader
+import difflib
 
 st.set_page_config(page_title="AI Kontierungs-Engine MVP", page_icon="📊", layout="wide")
 
@@ -12,40 +15,139 @@ try:
 except Exception:
     client = None
 
-SKR03_KONTEN = [
-    {"konto": 4930, "bezeichnung": "Bürobedarf", "beschreibung": "Schreibwaren, Ordner, Kopierpapier, Locher, Stifte."},
-    {"konto": 4940, "bezeichnung": "Zeitschriften, Bücher", "beschreibung": "Fachliteratur, Gesetzestexte, steuerrechtliche Kommentare."},
-    {"konto": 4920, "bezeichnung": "Telefon", "beschreibung": "Mobilfunkverträge, Festnetzanschlüsse, Internetgebühren."},
-    {"konto": 4650, "bezeichnung": "Bewirtungskosten", "beschreibung": "Kaffee fürs Büro, Kekse, Mitarbeiterverpflegung, Kundenbewirtung."}
-]
+# --- NEU: DYNAMISCHER KONTENRAHMEN UTILS ---
+def load_complete_chart_of_accounts():
+    """Lädt den kompletten Kontenrahmen aus der Textdatei."""
+    accounts = []
+    filename = "skr03_komplett.txt"
+    if os.path.exists(filename):
+        with open(filename, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip() and ";" in line:
+                    parts = line.strip().split(";")
+                    if len(parts) == 3:
+                        accounts.append({
+                            "konto": int(parts[0]),
+                            "bezeichnung": parts[1],
+                            "beschreibung": parts[2]
+                        })
+    else:
+        # Fallback, falls Datei fehlt
+        accounts = [
+            {"konto": 4930, "bezeichnung": "Bürobedarf", "beschreibung": "Schreibwaren, Ordner."},
+            {"konto": 4940, "bezeichnung": "Zeitschriften, Bücher", "beschreibung": "Fachliteratur."}
+        ]
+    return accounts
 
+# Alle echten Konten einmalig beim Start in den Speicher laden
+ALL_SKR03_KONTEN = load_complete_chart_of_accounts()
+
+def get_relevant_accounts(item_description, top_n=3):
+    """
+    Der RAG-Retriever: Sucht basierend auf der Positionsbeschreibung 
+    die mathematisch ähnlichsten Konten aus der Gesamtliste heraus.
+    """
+    # Wir bauen einen Such-String aus Bezeichnung und Beschreibung der Konten
+    choices = [f"{k['konto']} - {k['bezeichnung']}: {k['beschreibung']}" for k in ALL_SKR03_KONTEN]
+    
+    # Extrahiere die besten Treffer mittels Text-Ähnlichkeit
+    matches = difflib.get_close_matches(item_description, choices, n=top_n, cutoff=0.1)
+    
+    # Falls gar nichts matcht, nehmen wir standardmäßig die ersten 3 Konten als Fallback
+    if not matches:
+        return ALL_SKR03_KONTEN[:top_n]
+        
+    # Filter die echten Kontenobjekte heraus, die gematcht haben
+    relevant_accounts = []
+    for match in matches:
+        konto_num = int(match.split(" - ")[0])
+        for k in ALL_SKR03_KONTEN:
+            if k["konto"] == konto_num:
+                relevant_accounts.append(k)
+                break
+                
+    return relevant_accounts
+
+# --- RESTLICHE PARSER & CORE LOGIK ---
 def parse_e_invoice_xml(xml_file):
-    namespaces = {
-        'ns': 'urn:oasis:names:specification:ubl:schema:xsd:Invoice-2',
-        'cac': 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2',
-        'cbc': 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2'
-    }
     tree = ET.parse(xml_file)
     root = tree.getroot()
+    tag = root.tag
     
-    vendor_name = root.find('.//cac:AccountingSupplierParty/cac:Party/cac:PartyName/cbc:Name', namespaces).text
-    
-    parsed_lines = []
-    for line in root.findall('.//cac:InvoiceLine', namespaces):
-        line_id = line.find('cbc:ID', namespaces).text
-        item_name = line.find('.//cac:Item/cbc:Name', namespaces).text
-        amount = line.find('cbc:LineExtensionAmount', namespaces).text
-        parsed_lines.append({"id": line_id, "description": item_name, "amount": float(amount)})
+    # 1. FALL: CII Standard (ZUGFeRD)
+    if "CrossIndustryInvoice" in tag or tag.endswith("CrossIndustryInvoice"):
+        vendor_node = root.find('.//{*}SellerTradeParty//{*}Name')
+        vendor_name = vendor_node.text if vendor_node is not None else "Unbekannter Kreditor"
         
-    return vendor_name, parsed_lines
+        details_map = {}
+        for detail_node in root.findall('.//{*}IncludedSupplyChainTradeLineItem'):
+            line_id_node = detail_node.find('.//{*}AssociatedDocumentLineDocument/{*}LineID')
+            if line_id_node is not None:
+                details_map[line_id_node.text] = detail_node
+        
+        parsed_lines = []
+        for item_node in root.findall('.//{*}AssociatedDocumentLineDocument'):
+            line_id_node = item_node.find('{*}LineID')
+            if line_id_node is None:
+                continue
+            line_id = line_id_node.text
+            detail_node = details_map.get(line_id)
+            
+            if detail_node is not None:
+                item_name_node = detail_node.find('.//{*}SpecifiedTradeProduct/{*}Name')
+                amount_node = detail_node.find('.//{*}SpecifiedTradeSettlementLineMonetarySummation/{*}LineTotalAmount')
+                if amount_node is None:
+                    amount_node = detail_node.find('.//{*}LineTotalAmount')
+                
+                # NEU: Steuersatz aus CII extrahieren
+                tax_node = detail_node.find('.//{*}ApplicableTradeTax/{*}RateApplicablePercent')
+                tax_percent = float(tax_node.text) if tax_node is not None else 19.0
 
-def get_ki_kontierung(item, vendor_name):
+                if item_name_node is not None and amount_node is not None:
+                    parsed_lines.append({
+                        "id": line_id,
+                        "description": item_name_node.text,
+                        "amount": float(amount_node.text),
+                        "tax_percent": tax_percent
+                    })
+        return vendor_name, parsed_lines
+
+    # 2. FALL: UBL Standard (XRechnung)
+    elif "Invoice" in tag or tag.endswith("Invoice"):
+        vendor_node = root.find('.//{*}AccountingSupplierParty//{*}PartyName/{*}Name')
+        if vendor_node is None:
+            vendor_node = root.find('.//{*}AccountingSupplierParty//{*}Name')
+        vendor_name = vendor_node.text if vendor_node is not None else "Unbekannter Kreditor"
+        
+        parsed_lines = []
+        for line in root.findall('.//{*}InvoiceLine'):
+            line_id = line.find('{*}ID').text
+            item_name = line.find('.//{*}Item/{*}Name').text
+            amount = line.find('{*}LineExtensionAmount').text
+            
+            # NEU: Steuersatz aus UBL extrahieren
+            tax_node = line.find('.//{*}ClassifiedTaxCategory/{*}Percent')
+            tax_percent = float(tax_node.text) if tax_node is not None else 19.0
+            
+            parsed_lines.append({
+                "id": line_id, 
+                "description": item_name, 
+                "amount": float(amount),
+                "tax_percent": tax_percent
+            })
+        return vendor_name, parsed_lines
+    else:
+        raise ValueError("Unbekanntes E-Rechnungsformat.")
+
+# ÄNDERUNG: Akzeptiert jetzt die dynamisch gefilterten Optionen
+def get_ki_kontierung(item, vendor_name, gefilterte_optionen):
     system_prompt = (
         "Du bist ein hochpräziser Finanzbuchhalter. Kontiere die Position auf den SKR03.\n"
+        "Nutze AUSSCHLIESSLICH eines der übergebenen Konten im JSON-Format!\n"
         "Antworte AUSSCHLIESSLICH als JSON-Objekt:\n"
         "{\n  \"konto_soll\": 1234,\n  \"begruendung\": \"Fachliche Erklärung.\"\n}"
     )
-    user_prompt = f"Kreditor: {vendor_name}\nPosition: {item['description']}\nNetto: {item['amount']} EUR\nOptionen:\n{json.dumps(SKR03_KONTEN)}"
+    user_prompt = f"Kreditor: {vendor_name}\nPosition: {item['description']}\nNetto: {item['amount']} EUR\nErlaubte Optionen für diese Zeile:\n{json.dumps(gefilterte_optionen)}"
     
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -55,105 +157,141 @@ def get_ki_kontierung(item, vendor_name):
     )
     return json.loads(response.choices[0].message.content)
 
+# ÄNDERUNG: Validiert gegen die global geladenen echten Stammdaten
 def validate_kontierung(ki_res):
-    # Fix: Variable konsistent benennen
     vorgeschlagenes_konto = ki_res.get("konto_soll")
-    gueltige_konten = [k["konto"] for k in SKR03_KONTEN]
-    
+    gueltige_konten = [k["konto"] for k in ALL_SKR03_KONTEN]
     if vorgeschlagenes_konto not in gueltige_konten:
-        return False, f"Konto {vorgeschlagenes_konto} ungültig."
+        return False, f"Konto {vorgeschlagenes_konto} ist im SKR03-Stamm nicht existent."
     return True, "APPROVED"
 
-# --- NEU: DATEV CSV GENERATOR ---
 def create_datev_csv(export_data):
     """
-    Erzeugt einen DATEV-kompatiblen Buchungsstapel als CSV im Speicher.
-    Gegenkonto (Haben) ist hier beispielhaft das Standard-Kreditor-Sammelkonto 70000.
+    Erzeugt einen DATEV-kompatiblen Buchungsstapel inklusive BU-Schlüssel für die Vorsteuer.
     """
     output = io.StringIO()
-    
-    # Header 1: DATEV-Format-Kennzeichnung (erforderlich für den Import)
-    # Erster Eintrag 'EXTF' steht für externen Verarbeitungsdatentyp
     output.write("EXTF;700;1;Buchungsstapel;;1;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n")
+    # Spaltenüberschriften um 'BU-Schlüssel' ergänzt
+    output.write("Umsatz;Soll/Haben;Konto;Gegenkonto;BU-Schlüssel;Buchungstext\n")
     
-    # Header 2: Spaltenüberschriften (DATEV-Standard)
-    # Umsatz;Soll/Haben;Konto;Gegenkonto;Buchungstext
-    output.write("Umsatz;Soll/Haben;Konto;Gegenkonto;Buchungstext\n")
-    
-    # Datenzeilen schreiben
     for row in export_data:
-        # DATEV nutzt standardmäßig das Semikolon und Komma für Dezimalzahlen
         betrag_str = f"{row['netto']:.2f}".replace('.', ',')
-        soll_konto = row['konto_soll']
-        haben_konto = 70000 # Dummy Kreditor
-        text = row['beschreibung'][:60] # DATEV limitiert Buchungstexte oft
         
-        output.write(f"{betrag_str};S;{soll_konto};{haben_konto};{text}\n")
+        # Deterministische Ermittlung des DATEV-Vorsteuerschlüssels
+        tax = row.get("tax_percent", 19.0)
+        if tax == 19.0:
+            bu_schluessel = "9"  # DATEV Kennziffer für 19% Vorsteuer
+        elif tax == 7.0:
+            bu_schluessel = "8"  # DATEV Kennziffer für 7% Vorsteuer
+        else:
+            bu_schluessel = ""   # Steuerfrei / Sonstige
+            
+        output.write(f"{betrag_str};S;{row['konto_soll']};70000;{bu_schluessel};{row['beschreibung'][:60]}\n")
         
     return output.getvalue()
 
+def extract_xml_from_zugferd(pdf_file):
+    reader = PdfReader(pdf_file)
+    zugferd_filenames = ["factur-x.xml", "zugferd-invoice.xml", "xrechnung-invoice.xml"]
+    try:
+        embedded_files = reader.attachments
+        for name in zugferd_filenames:
+            if name in embedded_files:
+                return embedded_files[name][0]
+    except Exception as e:
+        st.error(f"Fehler beim Suchen nach PDF-Anhängen: {e}")
+    return None
 
 # --- UI Layout ---
 st.title("📊 Autonome E-Rechnungs-Engine")
-st.subheader("MVP: Intelligente Zeilenkontierung mit DATEV-Export")
+st.subheader("MVP: Intelligente Zeilenkontierung mit RAG-Gedächtnis")
 
 if not client:
     st.error("Bitte stelle sicher, dass der OPENAI_API_KEY in den Umgebungsvariablen gesetzt ist.")
 
 with st.sidebar:
-    st.header("Geladener Kontenrahmen (Stammdaten)")
-    st.dataframe(SKR03_KONTEN, use_container_width=True)
+    st.header("Vollständige SKR03-Stammdaten")
+    st.dataframe(ALL_SKR03_KONTEN, use_container_width=True)
 
-uploaded_file = st.file_uploader("Lade eine E-Rechnungs-XML hoch (UBL/XRechnung)", type=["xml"])
+uploaded_file = st.file_uploader(
+    "Lade eine E-Rechnung hoch (XRechnung XML oder ZUGFeRD PDF)", 
+    type=["xml", "pdf"]
+)
 
 if uploaded_file is not None:
     try:
-        vendor, lines = parse_e_invoice_xml(uploaded_file)
+        xml_source = uploaded_file
+        if uploaded_file.name.endswith(".pdf"):
+            with st.spinner("Extrahiere ZUGFeRD-XML aus PDF..."):
+                xml_bytes = extract_xml_from_zugferd(uploaded_file)
+            if xml_bytes:
+                xml_source = io.BytesIO(xml_bytes)
+                st.info("ZUGFeRD-XML erfolgreich extrahiert!")
+            else:
+                st.error("Keine gültige ZUGFeRD-XML-Struktur in dieser PDF gefunden.")
+                st.stop()
+        
+        vendor, lines = parse_e_invoice_xml(xml_source)
         st.success(f"Rechnung erfolgreich eingelesen! **Kreditor:** {vendor}")
         
-        st.write("### Extrahierte Positionen & KI-Verarbeitung")
+        st.write("### Extrahierte Positionen & KI-Verarbeitung (RAG-optimiert)")
         
-        # Puffer, um validierte Daten für den Export zu sammeln
+        if "processing_cache" not in st.session_state or st.session_state.get("current_file") != uploaded_file.name:
+            st.session_state["processing_cache"] = []
+            st.session_state["current_file"] = uploaded_file.name
+            
+            with st.spinner("RAG-Engine sucht passende Konten & KI analysiert..."):
+                for item in lines:
+                    gefilterte_konten = get_relevant_accounts(item["description"], top_n=3)
+                    ki_res = get_ki_kontierung(item, vendor, gefilterte_konten)
+                    is_valid, msg = validate_kontierung(ki_res)
+                    
+                    st.session_state["processing_cache"].append({
+                        "item": item,
+                        "ki_res": ki_res,
+                        "is_valid": is_valid,
+                        "msg": msg,
+                        "gefilterte_konten": gefilterte_konten
+                    })
+
         validierte_buchungen_liste = []
         
-        for item in lines:
+        for index, cached_item in enumerate(st.session_state["processing_cache"]):
+            item = cached_item["item"]
+            ki_res = cached_item["ki_res"]
+            is_valid = cached_item["is_valid"]
+            msg = cached_item["msg"]
+            opt = cached_item["gefilterte_konten"]
+            
             with st.container():
                 col1, col2, col3 = st.columns([2, 1, 2])
                 
                 with col1:
                     st.markdown(f"**Pos {item['id']}:** {item['description']}")
-                    st.caption(f"Netto-Betrag: {item['amount']:.2f} EUR")
-                
-                with st.spinner("KI analysiert..."):
-                    ki_res = get_ki_kontierung(item, vendor)
-                    is_valid, msg = validate_kontierung(ki_res)
+                    # Hier geben wir den extrahierten Steuersatz im UI aus
+                    st.caption(f"Netto-Betrag: {item['amount']:.2f} EUR | 📝 Steuersatz: {item['tax_percent']}%")
+                    st.caption(f"💡 *RAG-Auswahl: {', '.join([str(k['konto']) for k in opt])}*")
                 
                 with col2:
                     if is_valid:
                         st.metric(label="Vorgeschlagenes Konto", value=str(ki_res['konto_soll']))
-                        
-                        # In den Export-Puffer schieben
                         validierte_buchungen_liste.append({
                             "netto": item['amount'],
                             "konto_soll": ki_res['konto_soll'],
-                            "beschreibung": item['description']
+                            "beschreibung": item['description'],
+                            "tax_percent": item['tax_percent'] # Für den CSV-Export sichern
                         })
                     else:
                         st.error(f"Fehler: {msg}")
                 
                 with col3:
-                    st.text_area("Buchungstext / Begründung", value=ki_res['begruendung'], key=f"text_{item['id']}", height=68)
+                    st.text_area("Buchungstext / Begründung", value=ki_res['begruendung'], key=f"text_{item['id']}_{index}", height=68)
                 
-                st.divider()
+                st.divider()  
         
-        # --- NEU: EXPORT SEKTION ---
         if validierte_buchungen_liste:
             st.write("### Prozess abschließen")
-            
-            # Generiere das DATEV CSV im Hintergrund
             datev_csv_content = create_datev_csv(validierte_buchungen_liste)
-            
-            # Streamlit Download Button
             st.download_button(
                 label="🚀 Kontierung übernehmen und Export nach DATEV",
                 data=datev_csv_content,
@@ -163,4 +301,4 @@ if uploaded_file is not None:
             )
                 
     except Exception as e:
-        st.error(f"Fehler beim Verarbeiten der XML-Struktur: {e}")
+        st.error(f"Fehler beim Verarbeiten der Struktur: {e}")
