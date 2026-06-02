@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
+         xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+         xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+    <cbc:SupplierAssignedAccountID>K-91823</cbc:SupplierAssignedAccountID>
+    <cac:AccountingSupplierParty>
+        <cac:Party>
+            <cac:PartyName><cbc:Name>Bürobedarf Müller GmbH</cbc:Name></cac:PartyName>
+        </cac:Party>
+    </cac:AccountingSupplierParty>
+    <cac:InvoiceLine>
+        <cbc:ID>1</cbc:ID>
+        <cbc:InvoicedQuantity unitCode="NAR">10</cbc:InvoicedQuantity>
+        <cbc:LineExtensionAmount currencyID="EUR">45.00</cbc:LineExtensionAmount>
+        <cac:Item>
+            <cbc:Name>Leitz Ordner A4 Wolkenmarmor</cbc:Name>
+        </cac:Item>
+    </cac:InvoiceLine>
+    <cac:InvoiceLine>
+        <cbc:ID>2</cbc:ID>
+        <cbc:InvoicedQuantity unitCode="NAR">1</cbc:InvoicedQuantity>
+        <cbc:LineExtensionAmount currencyID="EUR">120.00</cbc:LineExtensionAmount>
+        <cac:Item>
+            <cbc:Name>Fachbuch Handbuch zum Bilanzrecht 2026</cbc:Name>
+        </cac:Item>
+    </cac:InvoiceLine>
+</Invoice>
