@@ -2,5 +2,7 @@
 4600;Werbekosten;Anzeigen, Flyer, Grafikdesign, Texterstellung, Marketingagenturen, Google Ads.
 4650;Bewirtungskosten;Kaffee fürs Büro, Kekse, Mitarbeiterverpflegung, Kundenbewirtung.
 4920;Telefon;Mobilfunkverträge, Festnetzanschlüsse, Internetgebühren.
-4930;Bürobedarf;Schreibwaren, Ordner, Kopierpapier, Locher, Stifte.
+4930;Bürobedarf;Schreibwaren, Ordner, Kopierpapier, Locher, Stifte, Verbrauchsmaterial.
 4940;Zeitschriften, Bücher;Fachliteratur, Gesetzestexte, steuerrechtliche Kommentare.
+4950;Rechts- und Beratungskosten;Anwaltshonorare, Notarkosten, Steuerberater, Jahresabschluss.
+4960;Miete;Mietzahlungen für Büroräume, Hallen oder Geschäftsräume.

@@ -139,13 +139,16 @@ def parse_e_invoice_xml(xml_file):
     else:
         raise ValueError("Unbekanntes E-Rechnungsformat.")
 
-# ÄNDERUNG: Akzeptiert jetzt die dynamisch gefilterten Optionen
 def get_ki_kontierung(item, vendor_name, gefilterte_optionen):
     system_prompt = (
-        "Du bist ein hochpräziser Finanzbuchhalter. Kontiere die Position auf den SKR03.\n"
-        "Nutze AUSSCHLIESSLICH eines der übergebenen Konten im JSON-Format!\n"
+        "Du bist ein extrem pingeliger, konservativer deutscher Finanzbuchhalter.\n"
+        "Deine Aufgabe ist es, die Position exakt und ohne kreative Auslegung auf den SKR03 zu kontieren.\n\n"
+        "STRIKTE REGELN FÜR DEINE ENTSCHEIDUNG:\n"
+        "1. Physische oder digitale Bücher, Fachliteratur und Dokumentationen sind ZWINGEND als 'Zeitschriften, Bücher' (4940) zu kontieren. Niemals als Fremdleistung, auch wenn sie Wissen vermitteln.\n"
+        "2. IT-Entwicklung, Programmierung oder Projektarbeit von externen Freelancern/Subunternehmern sind Kern-Fremdleistungen (3100). Kontiere sie NUR DANN als Werbekosten (4600), wenn im Text explizit Marketing, SEO, Ads oder Design genannt werden.\n"
+        "3. Wähle das Konto, dessen Beschreibung primär und direkt den Belegtext trifft. Keine logischen Brücken bauen (z.B. 'Software hilft bei der Vermarktung, also Werbung' ist VERBOTEN!).\n\n"
         "Antworte AUSSCHLIESSLICH als JSON-Objekt:\n"
-        "{\n  \"konto_soll\": 1234,\n  \"begruendung\": \"Fachliche Erklärung.\"\n}"
+        "{\n  \"konto_soll\": 1234,\n  \"begruendung\": \"Kurze, rein fachliche Begründung.\"\n}"
     )
     user_prompt = f"Kreditor: {vendor_name}\nPosition: {item['description']}\nNetto: {item['amount']} EUR\nErlaubte Optionen für diese Zeile:\n{json.dumps(gefilterte_optionen)}"
     
