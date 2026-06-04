@@ -15,7 +15,7 @@ try:
 except Exception:
     client = None
 
-# --- NEU: DYNAMISCHER KONTENRAHMEN UTILS ---
+# --- DYNAMISCHER KONTENRAHMEN UTILS ---
 def load_complete_chart_of_accounts():
     """Lädt den kompletten Kontenrahmen aus der Textdatei."""
     accounts = []
@@ -32,32 +32,20 @@ def load_complete_chart_of_accounts():
                             "beschreibung": parts[2]
                         })
     else:
-        # Fallback, falls Datei fehlt
         accounts = [
             {"konto": 4930, "bezeichnung": "Bürobedarf", "beschreibung": "Schreibwaren, Ordner."},
             {"konto": 4940, "bezeichnung": "Zeitschriften, Bücher", "beschreibung": "Fachliteratur."}
         ]
     return accounts
 
-# Alle echten Konten einmalig beim Start in den Speicher laden
 ALL_SKR03_KONTEN = load_complete_chart_of_accounts()
 
 def get_relevant_accounts(item_description, top_n=3):
-    """
-    Der RAG-Retriever: Sucht basierend auf der Positionsbeschreibung 
-    die mathematisch ähnlichsten Konten aus der Gesamtliste heraus.
-    """
-    # Wir bauen einen Such-String aus Bezeichnung und Beschreibung der Konten
+    """Der RAG-Retriever sucht via Textähnlichkeit passende Konten."""
     choices = [f"{k['konto']} - {k['bezeichnung']}: {k['beschreibung']}" for k in ALL_SKR03_KONTEN]
-    
-    # Extrahiere die besten Treffer mittels Text-Ähnlichkeit
     matches = difflib.get_close_matches(item_description, choices, n=top_n, cutoff=0.1)
-    
-    # Falls gar nichts matcht, nehmen wir standardmäßig die ersten 3 Konten als Fallback
     if not matches:
         return ALL_SKR03_KONTEN[:top_n]
-        
-    # Filter die echten Kontenobjekte heraus, die gematcht haben
     relevant_accounts = []
     for match in matches:
         konto_num = int(match.split(" - ")[0])
@@ -65,19 +53,78 @@ def get_relevant_accounts(item_description, top_n=3):
             if k["konto"] == konto_num:
                 relevant_accounts.append(k)
                 break
-                
     return relevant_accounts
 
-# --- RESTLICHE PARSER & CORE LOGIK ---
+
+# --- MATHEMATISCHE PRÜF-ENGINE ---
+def check_invoice_math(lines, invoice_totals):
+    """
+    Validiert die Grundrechenarten auf Positionsebene sowie die globalen Summen.
+    Erlaubt eine Rundungstoleranz von maximal 0.02 EUR.
+    """
+    audit_trail = []
+    has_math_error = False
+    tolerance = 0.02
+    
+    # 1. Positionsprüfung (Grundrechenarten)
+    calculated_net_total = 0.0
+    for idx, item in enumerate(lines, start=1):
+        line_net = item["amount"]
+        calculated_net_total += line_net
+        audit_trail.append(f"✅ Position {item['id']}: Extrahiert Netto {line_net:.2f} € (Steuersatz: {item['tax_percent']}%)")
+
+    # 2. Aggregierte Gesamtsummen-Prüfung gegen Dokumenten-Header
+    passed_net = invoice_totals.get("gesamt_netto", 0.0)
+    passed_tax = invoice_totals.get("gesamt_steuer", 0.0)
+    passed_gross = invoice_totals.get("gesamt_brutto", 0.0)
+    
+    # Check A: Summe der Positionen == Angegebenes Gesamt-Netto
+    if abs(calculated_net_total - passed_net) > tolerance:
+        audit_trail.append(f"❌ Netto-Summation fehlerhaft! Summe der Einzelpositionen ({calculated_net_total:.2f} €) weicht von Gesamt-Netto ({passed_net:.2f} €) ab.")
+        has_math_error = True
+    else:
+        audit_trail.append(f"✅ Netto-Summation konsistent ({passed_net:.2f} €)")
+
+    # Check B: Brutto-Addition (Netto + Steuer == Brutto)
+    if abs(passed_net + passed_tax - passed_gross) > tolerance:
+        audit_trail.append(f"❌ Brutto-Addition fehlerhaft! Netto ({passed_net:.2f} €) + Steuer ({passed_tax:.2f} €) ergibt nicht Brutto ({passed_gross:.2f} €)")
+        has_math_error = True
+    else:
+        audit_trail.append(f"✅ Brutto-Addition korrekt ({passed_gross:.2f} €)")
+
+    status = "RECHNUNG ABGEWIESEN" if has_math_error else "RECHNERISCHE PRÜFUNG ERFOLGREICH"
+    return status, audit_trail
+
+
+# --- PARSER & CORE LOGIK (MIT FIX FÜR SUMMEN-EXTRAKTION) ---
 def parse_e_invoice_xml(xml_file):
     tree = ET.parse(xml_file)
     root = tree.getroot()
     tag = root.tag
     
+    invoice_totals = {"gesamt_netto": 0.0, "gesamt_steuer": 0.0, "gesamt_brutto": 0.0}
+    
     # 1. FALL: CII Standard (ZUGFeRD)
     if "CrossIndustryInvoice" in tag or tag.endswith("CrossIndustryInvoice"):
         vendor_node = root.find('.//{*}SellerTradeParty//{*}Name')
         vendor_name = vendor_node.text if vendor_node is not None else "Unbekannter Kreditor"
+        
+        # --- FIX: Robuste Summen-Suche für ZUGFeRD (z.B. orgaMAX) ---
+        net_node, tax_node_tot, gross_node = None, None, None
+        
+        for summation in root.findall('.//{*}SpecifiedTradeSettlementMonetarySummation'):
+            net_node = summation.find('.//{*}TaxBasisTotalAmount')
+            tax_node_tot = summation.find('.//{*}TaxTotalAmount')
+            gross_node = summation.find('.//{*}GrandTotalAmount')
+            
+        # Fallback, falls verschachtelte Suche fehlschlägt
+        if net_node is None: net_node = root.find('.//{*}TaxBasisTotalAmount')
+        if tax_node_tot is None: tax_node_tot = root.find('.//{*}TaxTotalAmount')
+        if gross_node is None: gross_node = root.find('.//{*}GrandTotalAmount')
+        
+        if net_node is not None: invoice_totals["gesamt_netto"] = float(net_node.text)
+        if tax_node_tot is not None: invoice_totals["gesamt_steuer"] = float(tax_node_tot.text)
+        if gross_node is not None: invoice_totals["gesamt_brutto"] = float(gross_node.text)
         
         details_map = {}
         for detail_node in root.findall('.//{*}IncludedSupplyChainTradeLineItem'):
@@ -99,7 +146,6 @@ def parse_e_invoice_xml(xml_file):
                 if amount_node is None:
                     amount_node = detail_node.find('.//{*}LineTotalAmount')
                 
-                # NEU: Steuersatz aus CII extrahieren
                 tax_node = detail_node.find('.//{*}ApplicableTradeTax/{*}RateApplicablePercent')
                 tax_percent = float(tax_node.text) if tax_node is not None else 19.0
 
@@ -110,7 +156,7 @@ def parse_e_invoice_xml(xml_file):
                         "amount": float(amount_node.text),
                         "tax_percent": tax_percent
                     })
-        return vendor_name, parsed_lines
+        return vendor_name, parsed_lines, invoice_totals
 
     # 2. FALL: UBL Standard (XRechnung)
     elif "Invoice" in tag or tag.endswith("Invoice"):
@@ -119,13 +165,21 @@ def parse_e_invoice_xml(xml_file):
             vendor_node = root.find('.//{*}AccountingSupplierParty//{*}Name')
         vendor_name = vendor_node.text if vendor_node is not None else "Unbekannter Kreditor"
         
+        # Gesamtsummen extrahieren
+        net_node = root.find('.//{*}LegalMonetaryTotal/{*}LineExtensionAmount')
+        tax_node_tot = root.find('.//{*}TaxTotal/{*}TaxAmount')
+        gross_node = root.find('.//{*}LegalMonetaryTotal/{*}TaxInclusiveAmount')
+        
+        if net_node is not None: invoice_totals["gesamt_netto"] = float(net_node.text)
+        if tax_node_tot is not None: invoice_totals["gesamt_steuer"] = float(tax_node_tot.text)
+        if gross_node is not None: invoice_totals["gesamt_brutto"] = float(gross_node.text)
+        
         parsed_lines = []
         for line in root.findall('.//{*}InvoiceLine'):
             line_id = line.find('{*}ID').text
             item_name = line.find('.//{*}Item/{*}Name').text
             amount = line.find('{*}LineExtensionAmount').text
             
-            # NEU: Steuersatz aus UBL extrahieren
             tax_node = line.find('.//{*}ClassifiedTaxCategory/{*}Percent')
             tax_percent = float(tax_node.text) if tax_node is not None else 19.0
             
@@ -135,7 +189,7 @@ def parse_e_invoice_xml(xml_file):
                 "amount": float(amount),
                 "tax_percent": tax_percent
             })
-        return vendor_name, parsed_lines
+        return vendor_name, parsed_lines, invoice_totals
     else:
         raise ValueError("Unbekanntes E-Rechnungsformat.")
 
@@ -160,7 +214,6 @@ def get_ki_kontierung(item, vendor_name, gefilterte_optionen):
     )
     return json.loads(response.choices[0].message.content)
 
-# ÄNDERUNG: Validiert gegen die global geladenen echten Stammdaten
 def validate_kontierung(ki_res):
     vorgeschlagenes_konto = ki_res.get("konto_soll")
     gueltige_konten = [k["konto"] for k in ALL_SKR03_KONTEN]
@@ -169,28 +222,14 @@ def validate_kontierung(ki_res):
     return True, "APPROVED"
 
 def create_datev_csv(export_data):
-    """
-    Erzeugt einen DATEV-kompatiblen Buchungsstapel inklusive BU-Schlüssel für die Vorsteuer.
-    """
     output = io.StringIO()
     output.write("EXTF;700;1;Buchungsstapel;;1;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n")
-    # Spaltenüberschriften um 'BU-Schlüssel' ergänzt
     output.write("Umsatz;Soll/Haben;Konto;Gegenkonto;BU-Schlüssel;Buchungstext\n")
-    
     for row in export_data:
         betrag_str = f"{row['netto']:.2f}".replace('.', ',')
-        
-        # Deterministische Ermittlung des DATEV-Vorsteuerschlüssels
         tax = row.get("tax_percent", 19.0)
-        if tax == 19.0:
-            bu_schluessel = "9"  # DATEV Kennziffer für 19% Vorsteuer
-        elif tax == 7.0:
-            bu_schluessel = "8"  # DATEV Kennziffer für 7% Vorsteuer
-        else:
-            bu_schluessel = ""   # Steuerfrei / Sonstige
-            
+        bu_schluessel = "9" if tax == 19.0 else ("8" if tax == 7.0 else "")
         output.write(f"{betrag_str};S;{row['konto_soll']};70000;{bu_schluessel};{row['beschreibung'][:60]}\n")
-        
     return output.getvalue()
 
 def extract_xml_from_zugferd(pdf_file):
@@ -234,10 +273,28 @@ if uploaded_file is not None:
                 st.error("Keine gültige ZUGFeRD-XML-Struktur in dieser PDF gefunden.")
                 st.stop()
         
-        vendor, lines = parse_e_invoice_xml(xml_source)
+        vendor, lines, totals = parse_e_invoice_xml(xml_source)
         st.success(f"Rechnung erfolgreich eingelesen! **Kreditor:** {vendor}")
         
-        st.write("### Extrahierte Positionen & KI-Verarbeitung (RAG-optimiert)")
+        # --- SCHRITT 1: FORMELE & RECHNERISCHE PRÜFUNG ---
+        st.write("### 🧮 Schritt 1: Formale & Rechnerische Feststellung")
+        math_status, math_logs = check_invoice_math(lines, totals)
+        
+        # Expander bleibt standardmäßig eingeklappt, wenn alles grün ist
+        is_error = (math_status != "RECHNERISCHE PRÜFUNG ERFOLGREICH")
+        with st.expander(f"Prüfprotokoll anzeigen ({math_status})", expanded=is_error):
+            for log in math_logs:
+                if "❌" in log:
+                    st.error(log)
+                else:
+                    st.success(log)
+        
+        if is_error:
+            st.error("⚠️ KI-Verarbeitung gestoppt, da die Rechnung formale oder rechnerische Fehler aufweist.")
+            st.stop()
+            
+        # --- SCHRITT 2: KI KONTIERUNG ---
+        st.write("### 🤖 Schritt 2: Extrahierte Positionen & KI-Verarbeitung (RAG-optimiert)")
         
         if "processing_cache" not in st.session_state or st.session_state.get("current_file") != uploaded_file.name:
             st.session_state["processing_cache"] = []
@@ -258,7 +315,6 @@ if uploaded_file is not None:
                     })
 
         validierte_buchungen_liste = []
-        
         for index, cached_item in enumerate(st.session_state["processing_cache"]):
             item = cached_item["item"]
             ki_res = cached_item["ki_res"]
@@ -268,10 +324,8 @@ if uploaded_file is not None:
             
             with st.container():
                 col1, col2, col3 = st.columns([2, 1, 2])
-                
                 with col1:
                     st.markdown(f"**Pos {item['id']}:** {item['description']}")
-                    # Hier geben wir den extrahierten Steuersatz im UI aus
                     st.caption(f"Netto-Betrag: {item['amount']:.2f} EUR | 📝 Steuersatz: {item['tax_percent']}%")
                     st.caption(f"💡 *RAG-Auswahl: {', '.join([str(k['konto']) for k in opt])}*")
                 
@@ -282,21 +336,20 @@ if uploaded_file is not None:
                             "netto": item['amount'],
                             "konto_soll": ki_res['konto_soll'],
                             "beschreibung": item['description'],
-                            "tax_percent": item['tax_percent'] # Für den CSV-Export sichern
+                            "tax_percent": item['tax_percent']
                         })
                     else:
                         st.error(f"Fehler: {msg}")
                 
                 with col3:
                     st.text_area("Buchungstext / Begründung", value=ki_res['begruendung'], key=f"text_{item['id']}_{index}", height=68)
-                
                 st.divider()  
         
         if validierte_buchungen_liste:
-            st.write("### Prozess abschließen")
+            st.write("### 🚀 Schritt 3: Prozess abschließen")
             datev_csv_content = create_datev_csv(validierte_buchungen_liste)
             st.download_button(
-                label="🚀 Kontierung übernehmen und Export nach DATEV",
+                label="Kontierung übernehmen und Export nach DATEV",
                 data=datev_csv_content,
                 file_name="DATEV_Buchungsstapel_Export.csv",
                 mime="text/csv",
