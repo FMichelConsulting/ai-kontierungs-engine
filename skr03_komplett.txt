@@ -1,8 +1,15 @@
-3100;Fremdleistungen;Dienstleistungen von anderen Unternehmen, Subunternehmern oder Freelancern.
-4600;Werbekosten;Anzeigen, Flyer, Grafikdesign, Texterstellung, Marketingagenturen, Google Ads.
-4650;Bewirtungskosten;Kaffee fürs Büro, Kekse, Mitarbeiterverpflegung, Kundenbewirtung.
-4920;Telefon;Mobilfunkverträge, Festnetzanschlüsse, Internetgebühren.
-4930;Bürobedarf;Schreibwaren, Ordner, Kopierpapier, Locher, Stifte, Verbrauchsmaterial.
-4940;Zeitschriften, Bücher;Fachliteratur, Gesetzestexte, steuerrechtliche Kommentare.
-4950;Rechts- und Beratungskosten;Anwaltshonorare, Notarkosten, Steuerberater, Jahresabschluss.
-4960;Miete;Mietzahlungen für Büroräume, Hallen oder Geschäftsräume.
+3100;Fremdleistungen (Subunternehmer, Freelancer, IT-Dienstleistungen, Software-Entwicklung, externe Entwickler, Projekthonorare, handwerkliche Dienstleistungen Dritter)
+3400;Wareneingang 19% Vorsteuer (Handelswaren, Rohmaterialien, Bauteile, Komponenten, Materialien für den Weiterverkauf)
+4210;Miete für unbewegliche Wirtschaftsgüter (Büromiete, Coworking-Space, Hallenmiete, Stellplatz, Mietzins)
+4260;Instandhaltung betrieblicher Räume (Büroreinigung, Malerarbeiten, Reparaturen am Gebäude, Fensterputzer, Hausmeisterdienst)
+4600;Werbekosten (Marketing, Google Ads, LinkedIn Ads, Facebook Ads, Werbeagentur, Flyer, Visitenkarten, Grafikdesign, SEO-Optimierung, Sponsoring)
+4650;Bewirtungskosten (Geschäftsessen, Bewirtung von Mandanten, Kundenbewirtung, Restaurantbelege, Arbeitsessen)
+4700;Vertriebskosten (Verpackungsmaterial, Versandkosten, DHL, FedEx, UPS, Logistikdienstleistungen, Frachtkosten, Porto für Warensendungen)
+4805;Reparatur und Instandhaltung von Betriebs- und Geschäftsausstattung (IT-Wartung, PC-Reparatur, Server-Reparatur, Hardware-Austausch, Wartungsverträge für Maschinen)
+4910;Portokosten (Briefmarken, Einschreiben, DHL-Paket für normale Geschäftspost, Postgebühren)
+4920;Telefon und Internet (Mobilfunk, Congstar, Telekom, Vodafone, Internetanschluss, Cloud-Telefonie, DSL, Telefonanlage)
+4930;Bürobedarf (Schreibwaren, Kopierpapier, Toner, Druckerpatronen, Ordner, Stifte, Notizblöcke, Kalender)
+4940;Zeitschriften und Bücher (Fachliteratur, Fachbücher, Zeitschriften-Abos, Heise-Abo, Gesetzestexte, Online-Datenbanken für Fachwissen)
+4950;Rechts- und Beratungskosten (Steuerberater, Buchhaltungs-Software, Lexoffice, Sevdesk, Rechtsanwalt, Notar, Wirtschaftsprüfer, Abschlusserstellung)
+4960;Miete für Einrichtungen / Leasing (Drucker-Leasing, Kopierer-Miete, Kaffeemaschinen-Leasing, Server-Leasing)
+4980;Betriebsbedarf (Reinigungsmittel, Kaffee fürs Büro, Tee, Wasser für Mitarbeiter, Toilettenpapier, Seife, Kleinwerkzeuge)

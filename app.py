@@ -4,9 +4,9 @@ import json
 import pandas as pd
 import io
 import os
+import numpy as np
 from openai import OpenAI
 from pypdf import PdfReader
-import difflib
 
 st.set_page_config(page_title="AI Kontierungs-Engine MVP", page_icon="📊", layout="wide")
 
@@ -15,44 +15,89 @@ try:
 except Exception:
     client = None
 
-# --- DYNAMISCHER KONTENRAHMEN UTILS ---
-def load_complete_chart_of_accounts():
-    """Lädt den kompletten Kontenrahmen aus der Textdatei."""
+# --- MATHEMATISCHE UTILS FÜR SEMANTISCHE VEKTORSUCHE (RAG) ---
+def get_embedding(text, model="text-embedding-3-small"):
+    """Erzeugt einen semantischen Vektor für einen gegebenen Text über die OpenAI-API."""
+    if not client:
+        return None
+    text = text.replace("\n", " ")
+    try:
+        response = client.embeddings.create(input=[text], model=model)
+        return response.data[0].embedding
+    except Exception as e:
+        st.error(f"Fehler bei der Embedding-Generierung: {e}")
+        return None
+
+def cosine_similarity(a, b):
+    """Berechnet die mathematische Kosinus-Ähnlichkeit zwischen zwei Vektoren."""
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+@st.cache_resource
+def load_complete_chart_of_accounts_with_embeddings():
+    """
+    Lädt den kompletten Kontenrahmen aus der Textdatei und generiert 
+    einmalig beim App-Start die semantischen Vektoren (gemixt aus Name + Keywords).
+    """
     accounts = []
     filename = "skr03_komplett.txt"
     if os.path.exists(filename):
         with open(filename, "r", encoding="utf-8") as f:
             for line in f:
-                if line.strip() and ";" in line:
-                    parts = line.strip().split(";")
-                    if len(parts) == 3:
-                        accounts.append({
-                            "konto": int(parts[0]),
-                            "bezeichnung": parts[1],
-                            "beschreibung": parts[2]
-                        })
+                line_str = line.strip()
+                if line_str and ";" in line_str:
+                    parts = line_str.split(";")
+                    konto = int(parts[0])
+                    rest = parts[1]
+                    
+                    # Wenn Text runderneuerte Klammern enthält, trennen wir Bezeichnung und Keywords
+                    if "(" in rest and ")" in rest:
+                        bezeichnung = rest.split("(")[0].strip()
+                        beschreibung = rest.split("(")[1].replace(")", "").strip()
+                    else:
+                        bezeichnung = rest.strip()
+                        beschreibung = rest.strip()
+                    
+                    # Kombinierter Suchtext für das Embedding-Modell
+                    full_search_text = f"{bezeichnung}: {beschreibung}"
+                    
+                    # Einmalige Vektorgenerierung pro Konto (wird via st.cache_resource im RAM gehalten)
+                    with st.spinner(f"Generiere AI-Embedding für Konto {konto}..."):
+                        embedding = get_embedding(full_search_text)
+                        
+                    accounts.append({
+                        "konto": konto,
+                        "bezeichnung": bezeichnung,
+                        "beschreibung": beschreibung,
+                        "embedding": embedding
+                    })
     else:
+        # Minimaler Fallback, falls die Datei fehlt
         accounts = [
-            {"konto": 4930, "bezeichnung": "Bürobedarf", "beschreibung": "Schreibwaren, Ordner."},
-            {"konto": 4940, "bezeichnung": "Zeitschriften, Bücher", "beschreibung": "Fachliteratur."}
+            {"konto": 4930, "bezeichnung": "Bürobedarf", "beschreibung": "Schreibwaren, Ordner, Papier.", "embedding": None},
+            {"konto": 4940, "bezeichnung": "Zeitschriften, Bücher", "beschreibung": "Fachliteratur, Abos.", "embedding": None}
         ]
     return accounts
 
-ALL_SKR03_KONTEN = load_complete_chart_of_accounts()
+# Globaler Import der Stammdaten beim App-Initalisierungsprozess
+ALL_SKR03_KONTEN = load_complete_chart_of_accounts_with_embeddings()
 
 def get_relevant_accounts(item_description, top_n=3):
-    """Der RAG-Retriever sucht via Textähnlichkeit passende Konten."""
-    choices = [f"{k['konto']} - {k['bezeichnung']}: {k['beschreibung']}" for k in ALL_SKR03_KONTEN]
-    matches = difflib.get_close_matches(item_description, choices, n=top_n, cutoff=0.1)
-    if not matches:
+    """Der neue RAG-Retriever sucht via Vektor-Ähnlichkeit (Cosine Similarity) passende Konten."""
+    item_embedding = get_embedding(item_description)
+    if not item_embedding:
         return ALL_SKR03_KONTEN[:top_n]
-    relevant_accounts = []
-    for match in matches:
-        konto_num = int(match.split(" - ")[0])
-        for k in ALL_SKR03_KONTEN:
-            if k["konto"] == konto_num:
-                relevant_accounts.append(k)
-                break
+        
+    scored_accounts = []
+    for k in ALL_SKR03_KONTEN:
+        if k["embedding"] is not None:
+            score = cosine_similarity(item_embedding, k["embedding"])
+            scored_accounts.append((score, k))
+            
+    # Sortieren nach dem höchsten mathematischen Score (absteigend)
+    scored_accounts.sort(key=lambda x: x[0], reverse=True)
+    
+    # Die Top-N Konten extrahieren und zurückgeben
+    relevant_accounts = [item[1] for item in scored_accounts[:top_n]]
     return relevant_accounts
 
 
@@ -66,26 +111,22 @@ def check_invoice_math(lines, invoice_totals):
     has_math_error = False
     tolerance = 0.02
     
-    # 1. Positionsprüfung (Grundrechenarten)
     calculated_net_total = 0.0
-    for idx, item in enumerate(lines, start=1):
+    for item in lines:
         line_net = item["amount"]
         calculated_net_total += line_net
         audit_trail.append(f"✅ Position {item['id']}: Extrahiert Netto {line_net:.2f} € (Steuersatz: {item['tax_percent']}%)")
 
-    # 2. Aggregierte Gesamtsummen-Prüfung gegen Dokumenten-Header
     passed_net = invoice_totals.get("gesamt_netto", 0.0)
     passed_tax = invoice_totals.get("gesamt_steuer", 0.0)
     passed_gross = invoice_totals.get("gesamt_brutto", 0.0)
     
-    # Check A: Summe der Positionen == Angegebenes Gesamt-Netto
     if abs(calculated_net_total - passed_net) > tolerance:
         audit_trail.append(f"❌ Netto-Summation fehlerhaft! Summe der Einzelpositionen ({calculated_net_total:.2f} €) weicht von Gesamt-Netto ({passed_net:.2f} €) ab.")
         has_math_error = True
     else:
         audit_trail.append(f"✅ Netto-Summation konsistent ({passed_net:.2f} €)")
 
-    # Check B: Brutto-Addition (Netto + Steuer == Brutto)
     if abs(passed_net + passed_tax - passed_gross) > tolerance:
         audit_trail.append(f"❌ Brutto-Addition fehlerhaft! Netto ({passed_net:.2f} €) + Steuer ({passed_tax:.2f} €) ergibt nicht Brutto ({passed_gross:.2f} €)")
         has_math_error = True
@@ -96,7 +137,7 @@ def check_invoice_math(lines, invoice_totals):
     return status, audit_trail
 
 
-# --- PARSER & CORE LOGIK (MIT FIX FÜR SUMMEN-EXTRAKTION) ---
+# --- PARSER & CORE LOGIK (CII & UBL) ---
 def parse_e_invoice_xml(xml_file):
     tree = ET.parse(xml_file)
     root = tree.getroot()
@@ -104,20 +145,17 @@ def parse_e_invoice_xml(xml_file):
     
     invoice_totals = {"gesamt_netto": 0.0, "gesamt_steuer": 0.0, "gesamt_brutto": 0.0}
     
-    # 1. FALL: CII Standard (ZUGFeRD)
+    # 1. FALL: CII Standard (ZUGFeRD / Factur-X)
     if "CrossIndustryInvoice" in tag or tag.endswith("CrossIndustryInvoice"):
         vendor_node = root.find('.//{*}SellerTradeParty//{*}Name')
         vendor_name = vendor_node.text if vendor_node is not None else "Unbekannter Kreditor"
         
-        # --- FIX: Robuste Summen-Suche für ZUGFeRD (z.B. orgaMAX) ---
         net_node, tax_node_tot, gross_node = None, None, None
-        
         for summation in root.findall('.//{*}SpecifiedTradeSettlementMonetarySummation'):
             net_node = summation.find('.//{*}TaxBasisTotalAmount')
             tax_node_tot = summation.find('.//{*}TaxTotalAmount')
             gross_node = summation.find('.//{*}GrandTotalAmount')
             
-        # Fallback, falls verschachtelte Suche fehlschlägt
         if net_node is None: net_node = root.find('.//{*}TaxBasisTotalAmount')
         if tax_node_tot is None: tax_node_tot = root.find('.//{*}TaxTotalAmount')
         if gross_node is None: gross_node = root.find('.//{*}GrandTotalAmount')
@@ -165,7 +203,6 @@ def parse_e_invoice_xml(xml_file):
             vendor_node = root.find('.//{*}AccountingSupplierParty//{*}Name')
         vendor_name = vendor_node.text if vendor_node is not None else "Unbekannter Kreditor"
         
-        # Gesamtsummen extrahieren
         net_node = root.find('.//{*}LegalMonetaryTotal/{*}LineExtensionAmount')
         tax_node_tot = root.find('.//{*}TaxTotal/{*}TaxAmount')
         gross_node = root.find('.//{*}LegalMonetaryTotal/{*}TaxInclusiveAmount')
@@ -194,6 +231,14 @@ def parse_e_invoice_xml(xml_file):
         raise ValueError("Unbekanntes E-Rechnungsformat.")
 
 def get_ki_kontierung(item, vendor_name, gefilterte_optionen):
+    bereinigte_optionen = []
+    for opt in gefilterte_optionen:
+        bereinigte_optionen.append({
+            "konto": opt["konto"],
+            "bezeichnung": opt["bezeichnung"],
+            "beschreibung": opt["beschreibung"]
+        })
+
     system_prompt = (
         "Du bist ein extrem pingeliger, konservativer deutscher Finanzbuchhalter.\n"
         "Deine Aufgabe ist es, die Position exakt und ohne kreative Auslegung auf den SKR03 zu kontieren.\n\n"
@@ -204,7 +249,7 @@ def get_ki_kontierung(item, vendor_name, gefilterte_optionen):
         "Antworte AUSSCHLIESSLICH als JSON-Objekt:\n"
         "{\n  \"konto_soll\": 1234,\n  \"begruendung\": \"Kurze, rein fachliche Begründung.\"\n}"
     )
-    user_prompt = f"Kreditor: {vendor_name}\nPosition: {item['description']}\nNetto: {item['amount']} EUR\nErlaubte Optionen für diese Zeile:\n{json.dumps(gefilterte_optionen)}"
+    user_prompt = f"Kreditor: {vendor_name}\nPosition: {item['description']}\nNetto: {item['amount']} EUR\nErlaubte Optionen für diese Zeile:\n{json.dumps(bereinigte_optionen)}"
     
     response = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -244,7 +289,8 @@ def extract_xml_from_zugferd(pdf_file):
         st.error(f"Fehler beim Suchen nach PDF-Anhängen: {e}")
     return None
 
-# --- UI Layout ---
+
+# --- UI LAYOUT ---
 st.title("📊 Autonome E-Rechnungs-Engine")
 st.subheader("MVP: Intelligente Zeilenkontierung mit RAG-Gedächtnis")
 
@@ -253,26 +299,52 @@ if not client:
 
 with st.sidebar:
     st.header("Vollständige SKR03-Stammdaten")
-    st.dataframe(ALL_SKR03_KONTEN, use_container_width=True)
+    df_visual = pd.DataFrame(ALL_SKR03_KONTEN)[["konto", "bezeichnung", "beschreibung"]]
+    st.dataframe(df_visual, use_container_width=True)
 
-uploaded_file = st.file_uploader(
-    "Lade eine E-Rechnung hoch (XRechnung XML oder ZUGFeRD PDF)", 
-    type=["xml", "pdf"]
-)
+# Zwei Spalten für flexiblen Einstieg: Manueller Upload ODER Demo-Trigger
+col_up, col_demo = st.columns([2, 1])
+
+with col_up:
+    uploaded_file = st.file_uploader(
+        "1. Eigene E-Rechnung hochladen (XRechnung XML oder ZUGFeRD PDF)", 
+        type=["xml", "pdf"]
+    )
+
+with col_demo:
+    st.write("Keine E-Rechnung zur Hand?")
+    demo_triggered = st.button("🚀 Live-Demo-Daten laden", use_container_width=True)
+
+# Logik zur Bestimmung der Datenquelle
+xml_source = None
+file_name_label = ""
 
 if uploaded_file is not None:
+    xml_source = uploaded_file
+    file_name_label = uploaded_file.name
+    if uploaded_file.name.endswith(".pdf"):
+        with st.spinner("Extrahiere ZUGFeRD-XML aus PDF..."):
+            xml_bytes = extract_xml_from_zugferd(uploaded_file)
+        if xml_bytes:
+            xml_source = io.BytesIO(xml_bytes)
+            st.info("ZUGFeRD-XML erfolgreich extrahiert!")
+        else:
+            st.error("Keine gültige ZUGFeRD-XML-Struktur in dieser PDF gefunden.")
+            st.stop()
+
+elif demo_triggered:
+    demo_path = "test_invoices/steuerberater.xml"
+    if os.path.exists(demo_path):
+        with open(demo_path, "rb") as f:
+            xml_source = io.BytesIO(f.read())
+        file_name_label = "steuerberater_DEMO.xml"
+        st.success("🤖 Demo-Modus aktiv: Test-Rechnung 'Dr. Steuer & Partner' geladen!")
+    else:
+        st.error("Demo-Datei nicht im Verzeichnis gefunden.")
+
+# Nur ausführen, wenn eine Quelle (Upload oder Demo) existiert
+if xml_source is not None:
     try:
-        xml_source = uploaded_file
-        if uploaded_file.name.endswith(".pdf"):
-            with st.spinner("Extrahiere ZUGFeRD-XML aus PDF..."):
-                xml_bytes = extract_xml_from_zugferd(uploaded_file)
-            if xml_bytes:
-                xml_source = io.BytesIO(xml_bytes)
-                st.info("ZUGFeRD-XML erfolgreich extrahiert!")
-            else:
-                st.error("Keine gültige ZUGFeRD-XML-Struktur in dieser PDF gefunden.")
-                st.stop()
-        
         vendor, lines, totals = parse_e_invoice_xml(xml_source)
         st.success(f"Rechnung erfolgreich eingelesen! **Kreditor:** {vendor}")
         
@@ -280,7 +352,6 @@ if uploaded_file is not None:
         st.write("### 🧮 Schritt 1: Formale & Rechnerische Feststellung")
         math_status, math_logs = check_invoice_math(lines, totals)
         
-        # Expander bleibt standardmäßig eingeklappt, wenn alles grün ist
         is_error = (math_status != "RECHNERISCHE PRÜFUNG ERFOLGREICH")
         with st.expander(f"Prüfprotokoll anzeigen ({math_status})", expanded=is_error):
             for log in math_logs:
@@ -296,11 +367,11 @@ if uploaded_file is not None:
         # --- SCHRITT 2: KI KONTIERUNG ---
         st.write("### 🤖 Schritt 2: Extrahierte Positionen & KI-Verarbeitung (RAG-optimiert)")
         
-        if "processing_cache" not in st.session_state or st.session_state.get("current_file") != uploaded_file.name:
+        if "processing_cache" not in st.session_state or st.session_state.get("current_file") != file_name_label:
             st.session_state["processing_cache"] = []
-            st.session_state["current_file"] = uploaded_file.name
+            st.session_state["current_file"] = file_name_label
             
-            with st.spinner("RAG-Engine sucht passende Konten & KI analysiert..."):
+            with st.spinner("RAG-Engine sucht passende Konten via Semantik & KI analysiert..."):
                 for item in lines:
                     gefilterte_konten = get_relevant_accounts(item["description"], top_n=3)
                     ki_res = get_ki_kontierung(item, vendor, gefilterte_konten)
@@ -327,7 +398,7 @@ if uploaded_file is not None:
                 with col1:
                     st.markdown(f"**Pos {item['id']}:** {item['description']}")
                     st.caption(f"Netto-Betrag: {item['amount']:.2f} EUR | 📝 Steuersatz: {item['tax_percent']}%")
-                    st.caption(f"💡 *RAG-Auswahl: {', '.join([str(k['konto']) for k in opt])}*")
+                    st.caption(f"💡 *RAG-Vektor-Top-3: {', '.join([str(k['konto']) for k in opt])}*")
                 
                 with col2:
                     if is_valid:
@@ -358,3 +429,4 @@ if uploaded_file is not None:
                 
     except Exception as e:
         st.error(f"Fehler beim Verarbeiten der Struktur: {e}")
+        

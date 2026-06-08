@@ -4,3 +4,5 @@ test_invoices/
 *.pdf
 __pycache__/
 .streamlit/
+
+!test_invoices/

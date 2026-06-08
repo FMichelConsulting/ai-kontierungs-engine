@@ -1,25 +1,33 @@
 import os
 import glob
+import json
 # Wir importieren die Kernlogik direkt aus deiner bestehenden app.py
 from app import parse_e_invoice_xml, get_relevant_accounts, get_ki_kontierung
 
-# Definition der Ground Truth (Was MUSS mathematisch/fachlich herauskommen?)
+# Definition der erweiterten Ground Truth nach Aktualisierung der skr03_komplett.txt
 GROUND_TRUTH = {
-    "miete_buero.xml": 4960,       # Miete
+    "miete_buero.xml": 4210,        # Miete für unbewegliche Wirtschaftsgüter (angepasst!)
     "steuerberater.xml": 4950,     # Rechts- und Beratungskosten
     "internet_leitung.xml": 4920,   # Telefon / Internet
     "fachbuch_python.xml": 4940,    # Zeitschriften, Bücher
-    "subunternehmer_dev.xml": 3100  # Fremdleistungen
+    "subunternehmer_dev.xml": 3100, # Fremdleistungen
+    
+    # Neu hinzugefügte Test-Szenarien für die erweiterten Konten:
+    "google_ads.xml": 4600,         # Werbekosten
+    "kopierpapier.xml": 4930,       # Bürobedarf
+    "wareneingang_komp.xml": 3400,  # Wareneingang 19%
+    "buero_reinigung.xml": 4260,    # Instandhaltung betrieblicher Räume
+    "kaffee_buero.xml": 4980        # Betriebsbedarf
 }
 
 def run_benchmark():
     test_files = glob.glob("test_invoices/*.xml")
     if not test_files:
-        print("Keine Testdateien gefunden. Bitte zuerst generate_test_data.py ausführen.")
+        print("Keine Testdateien gefunden. Bitte stelle sicher, dass die XML-Dateien im Ordner 'test_invoices/' liegen.")
         return
 
     passed_tests = 0
-    total_tests = len(test_files)
+    evaluated_tests = 0
     
     print("\n==================================================")
     print("STARTING REGRESSION BENCHMARK FOR AI ACCOUNTING ENGINE")
@@ -33,10 +41,15 @@ def run_benchmark():
             print(f"[SKIP] Keine Ground Truth für {filename} definiert.")
             continue
             
+        evaluated_tests += 1
         try:
-            # 1. Parsing
-            vendor, lines = parse_e_invoice_xml(file_path)
-            item = lines[0] # Wir wissen, dass unsere Testdateien eine Zeile haben
+            # 1. Parsing - JETZT MIT FIX FÜR DEN RECHNERISCHEN DRITTEN RÜCKGABEWERT (totals)
+            vendor, lines, totals = parse_e_invoice_xml(file_path)
+            if not lines:
+                print(f"[ERROR] Keine Positionen in {filename} gefunden.")
+                continue
+                
+            item = lines[0] # Testdateien enthalten typischerweise eine Fokus-Zeile
             
             # 2. RAG Retrieval
             gefilterte_konten = get_relevant_accounts(item["description"], top_n=3)
@@ -52,15 +65,19 @@ def run_benchmark():
             else:
                 print(f"[FAIL] {filename:<25} -> Erwartet: {expected_konto} | KI: {predicted_konto} ❌")
                 print(f"       Begruendung KI: {ki_res.get('begruendung')}")
+                print(f"       RAG-Auswahl war: {[k['konto'] for k in gefilterte_konten]}")
                 
         except Exception as e:
             print(f"[ERROR] Fehler beim Verarbeiten von {filename}: {e}")
 
-    accuracy = (passed_tests / total_tests) * 100
-    print("\n==================================================")
-    print(f"BENCHMARK ERGEBNIS: {passed_tests} von {total_tests} Tests bestanden.")
-    print(f"Modell-Präzision (Accuracy): {accuracy:.1f}%")
-    print("==================================================\n")
+    if evaluated_tests > 0:
+        accuracy = (passed_tests / evaluated_tests) * 100
+        print("\n==================================================")
+        print(f"BENCHMARK ERGEBNIS: {passed_tests} von {evaluated_tests} relevanten Tests bestanden.")
+        print(f"Modell-Präzision (Accuracy): {accuracy:.1f}%")
+        print("==================================================\n")
+    else:
+        print("\n[WARN] Keine passenden Ground-Truth-Testdateien verarbeitet.")
 
 if __name__ == "__main__":
     run_benchmark()

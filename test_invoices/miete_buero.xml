@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rsm:CrossIndustryInvoice xmlns:rsm="urn:uncefact:data:standard:CrossIndustryInvoice:100" xmlns:ram="urn:uncefact:data:standard:ReusableAggregateBusinessInformationEntity:100">
+    <rsm:SupplyChainTradeTransaction>
+        <ram:ApplicableHeaderTradeAgreement>
+            <ram:SellerTradeParty>
+                <ram:Name>Immobilien GmbH &amp; Co. KG</ram:Name>
+            </ram:SellerTradeParty>
+        </ram:ApplicableHeaderTradeAgreement>
+        <ram:ApplicableHeaderTradeDelivery/>
+        <ram:ApplicableHeaderTradeSettlement>
+            <ram:SpecifiedTradeSettlementMonetarySummation>
+                <ram:TaxBasisTotalAmount>100.00</ram:TaxBasisTotalAmount>
+                <ram:TaxTotalAmount>19.00</ram:TaxTotalAmount>
+                <ram:GrandTotalAmount>119.00</ram:GrandTotalAmount>
+            </ram:SpecifiedTradeSettlementMonetarySummation>
+        </ram:ApplicableHeaderTradeSettlement>
+        <ram:IncludedSupplyChainTradeLineItem>
+            <ram:AssociatedDocumentLineDocument>
+                <ram:LineID>1</ram:LineID>
+            </ram:AssociatedDocumentLineDocument>
+            <ram:SpecifiedTradeProduct>
+                <ram:Name>Monatliche Bueromiete Hauptstandort Etage 2</ram:Name>
+            </ram:SpecifiedTradeProduct>
+            <ram:SpecifiedLineTradeAgreement/>
+            <ram:SpecifiedLineTradeDelivery/>
+            <ram:SpecifiedLineTradeSettlement>
+                <ram:ApplicableTradeTax>
+                    <ram:RateApplicablePercent>19.0</ram:RateApplicablePercent>
+                </ram:ApplicableTradeTax>
+                <ram:SpecifiedTradeSettlementLineMonetarySummation>
+                    <ram:LineTotalAmount>100.00</ram:LineTotalAmount>
+                </ram:SpecifiedTradeSettlementLineMonetarySummation>
+            </ram:SpecifiedLineTradeSettlement>
+        </ram:IncludedSupplyChainTradeLineItem>
+    </rsm:SupplyChainTradeTransaction>
+</rsm:CrossIndustryInvoice>
