@@ -237,14 +237,32 @@ def validate_kontierung(ki_res):
     return True, "APPROVED"
 
 def create_datev_csv(export_data):
+    """
+    Erzeugt einen DATEV-konformen EXTF-Buchungsstapel.
+    Jede Rechnungsposition wird als eigenständiger Buchungssatz (Split) exportiert.
+    WICHTIG: DATEV erwartet bei Nutzung von BU-Schlüsseln den BRUTTO-Umsatz der Position!
+    """
     output = io.StringIO()
+    # DATEV Header-Zeile
     output.write("EXTF;700;1;Buchungsstapel;;1;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n")
     output.write("Umsatz;Soll/Haben;Konto;Gegenkonto;BU-Schlüssel;Buchungstext\n")
+    
     for row in export_data:
-        betrag_str = f"{row['netto']:.2f}".replace('.', ',')
-        tax = row.get("tax_percent", 19.0)
-        bu_schluessel = "9" if tax == 19.0 else ("8" if tax == 7.0 else "")
-        output.write(f"{betrag_str};S;{row['konto_soll']};70000;{bu_schluessel};{row['beschreibung'][:60]}\n")
+        # Mathematische Brutto-Ermittlung für den DATEV-Umsatz
+        netto = row['netto']
+        tax_percent = row.get("tax_percent", 19.0)
+        brutto = netto * (1.0 + (tax_percent / 100.0))
+        
+        # DATEV-Formatierung (Deutsches Komma als Dezimaltrenner)
+        betrag_str = f"{brutto:.2f}".replace('.', ',')
+        
+        bu_schluessel = "9" if tax_percent == 19.0 else ("8" if tax_percent == 7.0 else "")
+        
+        # Begrenzung des Buchungstextes auf 60 Zeichen (DATEV-Limit)
+        buchungstext = row['beschreibung'][:60].replace(';', ' ')
+        
+        output.write(f"{betrag_str};S;{row['konto_soll']};70000;{bu_schluessel};{buchungstext}\n")
+        
     return output.getvalue()
 
 def extract_xml_from_zugferd(pdf_file):
@@ -383,7 +401,7 @@ if xml_source is not None:
                         validierte_buchungen_liste.append({
                             "netto": item['amount'],
                             "konto_soll": ki_res['konto_soll'],
-                            "beschreibung": item['description'],
+                            "beschreibung": f"{vendor}: {item['description']}",
                             "tax_percent": item['tax_percent']
                         })
                     else:
@@ -407,4 +425,3 @@ if xml_source is not None:
     except Exception as e:
         st.error(f"Fehler beim Verarbeiten der Struktur: {e}")
 
-        
