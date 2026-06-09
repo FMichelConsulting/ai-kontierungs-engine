@@ -32,57 +32,27 @@ def cosine_similarity(a, b):
     """Berechnet die mathematische Kosinus-Ähnlichkeit zwischen zwei Vektoren."""
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-@st.cache_resource
 def load_complete_chart_of_accounts_with_embeddings():
     """
-    Lädt den kompletten Kontenrahmen aus der Textdatei und generiert 
-    einmalig beim App-Start die semantischen Vektoren (gemixt aus Name + Keywords).
+    Lädt den vorkalkulierten Kontenrahmen inklusive der semantischen Vektoren
+    blitzschnell aus der lokalen JSON-Datei. Verhindert API-Kaltstart-Latenzen.
     """
-    accounts = []
-    filename = "skr03_komplett.txt"
-    if os.path.exists(filename):
-        with open(filename, "r", encoding="utf-8") as f:
-            for line in f:
-                line_str = line.strip()
-                if line_str and ";" in line_str:
-                    parts = line_str.split(";")
-                    konto = int(parts[0])
-                    rest = parts[1]
-                    
-                    # Wenn Text runderneuerte Klammern enthält, trennen wir Bezeichnung und Keywords
-                    if "(" in rest and ")" in rest:
-                        bezeichnung = rest.split("(")[0].strip()
-                        beschreibung = rest.split("(")[1].replace(")", "").strip()
-                    else:
-                        bezeichnung = rest.strip()
-                        beschreibung = rest.strip()
-                    
-                    # Kombinierter Suchtext für das Embedding-Modell
-                    full_search_text = f"{bezeichnung}: {beschreibung}"
-                    
-                    # Einmalige Vektorgenerierung pro Konto (wird via st.cache_resource im RAM gehalten)
-                    with st.spinner(f"Generiere AI-Embedding für Konto {konto}..."):
-                        embedding = get_embedding(full_search_text)
-                        
-                    accounts.append({
-                        "konto": konto,
-                        "bezeichnung": bezeichnung,
-                        "beschreibung": beschreibung,
-                        "embedding": embedding
-                    })
+    json_filename = "skr03_with_embeddings.json"
+    if os.path.exists(json_filename):
+        with open(json_filename, "r", encoding="utf-8") as f:
+            return json.load(f)
     else:
-        # Minimaler Fallback, falls die Datei fehlt
-        accounts = [
+        st.warning(f"Cache-Datei {json_filename} nicht gefunden! Nutze minimalen Fallback.")
+        return [
             {"konto": 4930, "bezeichnung": "Bürobedarf", "beschreibung": "Schreibwaren, Ordner, Papier.", "embedding": None},
             {"konto": 4940, "bezeichnung": "Zeitschriften, Bücher", "beschreibung": "Fachliteratur, Abos.", "embedding": None}
         ]
-    return accounts
 
-# Globaler Import der Stammdaten beim App-Initalisierungsprozess
+# Globaler Import der Stammdaten aus dem lokalen JSON-Cache
 ALL_SKR03_KONTEN = load_complete_chart_of_accounts_with_embeddings()
 
 def get_relevant_accounts(item_description, top_n=3):
-    """Der neue RAG-Retriever sucht via Vektor-Ähnlichkeit (Cosine Similarity) passende Konten."""
+    """Der RAG-Retriever sucht via Vektor-Ähnlichkeit (Cosine Similarity) passende Konten."""
     item_embedding = get_embedding(item_description)
     if not item_embedding:
         return ALL_SKR03_KONTEN[:top_n]
@@ -302,6 +272,10 @@ with st.sidebar:
     df_visual = pd.DataFrame(ALL_SKR03_KONTEN)[["konto", "bezeichnung", "beschreibung"]]
     st.dataframe(df_visual, use_container_width=True)
 
+# --- SESSION STATE INITIALISIERUNG ---
+if "demo_active" not in st.session_state:
+    st.session_state["demo_active"] = False
+
 # Zwei Spalten für flexiblen Einstieg: Manueller Upload ODER Demo-Trigger
 col_up, col_demo = st.columns([2, 1])
 
@@ -310,10 +284,13 @@ with col_up:
         "1. Eigene E-Rechnung hochladen (XRechnung XML oder ZUGFeRD PDF)", 
         type=["xml", "pdf"]
     )
+    if uploaded_file is not None:
+        st.session_state["demo_active"] = False  # Demo deaktivieren, wenn manuell geladen wird
 
 with col_demo:
     st.write("Keine E-Rechnung zur Hand?")
-    demo_triggered = st.button("🚀 Live-Demo-Daten laden", use_container_width=True)
+    if st.button("🚀 Live-Demo-Daten laden", use_container_width=True):
+        st.session_state["demo_active"] = True
 
 # Logik zur Bestimmung der Datenquelle
 xml_source = None
@@ -332,7 +309,7 @@ if uploaded_file is not None:
             st.error("Keine gültige ZUGFeRD-XML-Struktur in dieser PDF gefunden.")
             st.stop()
 
-elif demo_triggered:
+elif st.session_state["demo_active"]:
     demo_path = "test_invoices/steuerberater.xml"
     if os.path.exists(demo_path):
         with open(demo_path, "rb") as f:
@@ -348,7 +325,7 @@ if xml_source is not None:
         vendor, lines, totals = parse_e_invoice_xml(xml_source)
         st.success(f"Rechnung erfolgreich eingelesen! **Kreditor:** {vendor}")
         
-        # --- SCHRITT 1: FORMELE & RECHNERISCHE PRÜFUNG ---
+        # --- SCHRITT 1: FORMALE & RECHNERISCHE PRÜFUNG ---
         st.write("### 🧮 Schritt 1: Formale & Rechnerische Feststellung")
         math_status, math_logs = check_invoice_math(lines, totals)
         
@@ -429,4 +406,5 @@ if xml_source is not None:
                 
     except Exception as e:
         st.error(f"Fehler beim Verarbeiten der Struktur: {e}")
+
         
