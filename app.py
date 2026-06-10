@@ -32,43 +32,41 @@ def cosine_similarity(a, b):
     """Berechnet die mathematische Kosinus-Ähnlichkeit zwischen zwei Vektoren."""
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def load_complete_chart_of_accounts_with_embeddings():
+def load_chart_of_accounts_by_system(system_name):
     """
-    Lädt den vorkalkulierten Kontenrahmen inklusive der semantischen Vektoren
-    blitzschnell aus der lokalen JSON-Datei. Verhindert API-Kaltstart-Latenzen.
+    Lädt den passenden Kontenrahmen inklusive Vektoren basierend auf dem Zielsystem.
+    Verhindert API-Kaltstart-Latenzen durch Nutzung lokaler JSON-Caches.
     """
-    json_filename = "skr03_with_embeddings.json"
+    mapping = {
+        "DATEV (SKR03)": "skr03_with_embeddings.json",
+        "SAP (YCOA)": "sap_ycoa_with_embeddings.json",
+        "Kameralistik (Kommune)": "kameralistik_kommune_with_embeddings.json"
+    }
+    
+    json_filename = mapping.get(system_name, "skr03_with_embeddings.json")
+    
     if os.path.exists(json_filename):
         with open(json_filename, "r", encoding="utf-8") as f:
             return json.load(f)
     else:
         st.warning(f"Cache-Datei {json_filename} nicht gefunden! Nutze minimalen Fallback.")
-        return [
-            {"konto": 4930, "bezeichnung": "Bürobedarf", "beschreibung": "Schreibwaren, Ordner, Papier.", "embedding": None},
-            {"konto": 4940, "bezeichnung": "Zeitschriften, Bücher", "beschreibung": "Fachliteratur, Abos.", "embedding": None}
-        ]
+        return [{"konto": 9999, "bezeichnung": "Allgemeines Fallback-Konto", "beschreibung": "Fallback-Stamm", "embedding": None}]
 
-# Globaler Import der Stammdaten aus dem lokalen JSON-Cache
-ALL_SKR03_KONTEN = load_complete_chart_of_accounts_with_embeddings()
-
-def get_relevant_accounts(item_description, top_n=3):
-    """Der RAG-Retriever sucht via Vektor-Ähnlichkeit (Cosine Similarity) passende Konten."""
+def get_relevant_accounts(item_description, current_accounts, top_n=3):
+    """Der RAG-Retriever sucht via Vektor-Ähnlichkeit passende Konten im aktuellen Stamm."""
     item_embedding = get_embedding(item_description)
     if not item_embedding:
-        return ALL_SKR03_KONTEN[:top_n]
+        return [{**k, "similarity_score": 0.0} for k in current_accounts[:top_n]]
         
     scored_accounts = []
-    for k in ALL_SKR03_KONTEN:
+    for k in current_accounts:
         if k["embedding"] is not None:
             score = cosine_similarity(item_embedding, k["embedding"])
-            scored_accounts.append((score, k))
+            konto_with_score = {**k, "similarity_score": float(score)}
+            scored_accounts.append(konto_with_score)
             
-    # Sortieren nach dem höchsten mathematischen Score (absteigend)
-    scored_accounts.sort(key=lambda x: x[0], reverse=True)
-    
-    # Die Top-N Konten extrahieren und zurückgeben
-    relevant_accounts = [item[1] for item in scored_accounts[:top_n]]
-    return relevant_accounts
+    scored_accounts.sort(key=lambda x: x["similarity_score"], reverse=True)
+    return scored_accounts[:top_n]
 
 
 # --- MATHEMATISCHE PRÜF-ENGINE ---
@@ -211,11 +209,11 @@ def get_ki_kontierung(item, vendor_name, gefilterte_optionen):
 
     system_prompt = (
         "Du bist ein extrem pingeliger, konservativer deutscher Finanzbuchhalter.\n"
-        "Deine Aufgabe ist es, die Position exakt und ohne kreative Auslegung auf den SKR03 zu kontieren.\n\n"
+        "Deine Aufgabe ist es, die Position exakt und ohne kreative Auslegung auf den bereitgestellten Kontenrahmen zu kontieren.\n\n"
         "STRIKTE REGELN FÜR DEINE ENTSCHEIDUNG:\n"
-        "1. Physische oder digitale Bücher, Fachliteratur und Dokumentationen sind ZWINGEND als 'Zeitschriften, Bücher' (4940) zu kontieren. Niemals als Fremdleistung, auch wenn sie Wissen vermitteln.\n"
-        "2. IT-Entwicklung, Programmierung oder Projektarbeit von externen Freelancern/Subunternehmern sind Kern-Fremdleistungen (3100). Kontiere sie NUR DANN als Werbekosten (4600), wenn im Text explizit Marketing, SEO, Ads oder Design genannt werden.\n"
-        "3. Wähle das Konto, dessen Beschreibung primär und direkt den Belegtext trifft. Keine logischen Brücken bauen (z.B. 'Software hilft bei der Vermarktung, also Werbung' ist VERBOTEN!).\n\n"
+        "1. Physische oder digitale Bücher, Fachliteratur und Dokumentationen sind ZWINGEND als Fachliteratur/Bücher (z.B. 4940, 482000 oder 53100) zu kontieren.\n"
+        "2. IT-Entwicklung, Programmierung oder Projektarbeit von externen Freelancern sind Kern-Fremdleistungen.\n"
+        "3. Wähle das Konto, dessen Beschreibung primär und direkt den Belegtext trifft. Keine logischen Brücken bauen.\n\n"
         "Antworte AUSSCHLIESSLICH als JSON-Objekt:\n"
         "{\n  \"konto_soll\": 1234,\n  \"begruendung\": \"Kurze, rein fachliche Begründung.\"\n}"
     )
@@ -229,11 +227,11 @@ def get_ki_kontierung(item, vendor_name, gefilterte_optionen):
     )
     return json.loads(response.choices[0].message.content)
 
-def validate_kontierung(ki_res):
+def validate_kontierung(ki_res, current_accounts):
     vorgeschlagenes_konto = ki_res.get("konto_soll")
-    gueltige_konten = [k["konto"] for k in ALL_SKR03_KONTEN]
+    gueltige_konten = [k["konto"] for k in current_accounts]
     if vorgeschlagenes_konto not in gueltige_konten:
-        return False, f"Konto {vorgeschlagenes_konto} ist im SKR03-Stamm nicht existent."
+        return False, f"Konto {vorgeschlagenes_konto} ist im gewählten Stamm nicht existent."
     return True, "APPROVED"
 
 def create_datev_csv(export_data):
@@ -243,22 +241,16 @@ def create_datev_csv(export_data):
     WICHTIG: DATEV erwartet bei Nutzung von BU-Schlüsseln den BRUTTO-Umsatz der Position!
     """
     output = io.StringIO()
-    # DATEV Header-Zeile
     output.write("EXTF;700;1;Buchungsstapel;;1;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n")
     output.write("Umsatz;Soll/Haben;Konto;Gegenkonto;BU-Schlüssel;Buchungstext\n")
     
     for row in export_data:
-        # Mathematische Brutto-Ermittlung für den DATEV-Umsatz
         netto = row['netto']
         tax_percent = row.get("tax_percent", 19.0)
         brutto = netto * (1.0 + (tax_percent / 100.0))
         
-        # DATEV-Formatierung (Deutsches Komma als Dezimaltrenner)
         betrag_str = f"{brutto:.2f}".replace('.', ',')
-        
         bu_schluessel = "9" if tax_percent == 19.0 else ("8" if tax_percent == 7.0 else "")
-        
-        # Begrenzung des Buchungstextes auf 60 Zeichen (DATEV-Limit)
         buchungstext = row['beschreibung'][:60].replace(';', ' ')
         
         output.write(f"{betrag_str};S;{row['konto_soll']};70000;{bu_schluessel};{buchungstext}\n")
@@ -277,24 +269,42 @@ def extract_xml_from_zugferd(pdf_file):
         st.error(f"Fehler beim Suchen nach PDF-Anhängen: {e}")
     return None
 
+def on_erp_system_change():
+    """Wird getriggert, wenn der Nutzer das ERP-System umschaltet. Löscht den Ausführungs-Cache."""
+    if "processing_cache" in st.session_state:
+        del st.session_state["processing_cache"]
+    if "current_file" in st.session_state:
+        del st.session_state["current_file"]
+    # Schaltet den automatischen Demo-Modus ab, damit die App auf Input wartet
+    st.session_state["demo_active"] = False
 
 # --- UI LAYOUT ---
 st.title("📊 Autonome E-Rechnungs-Engine")
-st.subheader("MVP: Intelligente Zeilenkontierung mit RAG-Gedächtnis")
+st.subheader("Cross-Platform Multi-ERP Routing Engine für Corporate Governance")
 
-if not client:
-    st.error("Bitte stelle sicher, dass der OPENAI_API_KEY in den Umgebungsvariablen gesetzt ist.")
+# --- SYSTEM AUSWAHL (Jetzt mit automatischem GUI-Reset bei Umschaltung) ---
+target_system = st.radio(
+    "🎯 Wählen Sie das Ziel-ERP / Rechnungslegungssystem für das automatische Routing:",
+    ["DATEV (SKR03)", "SAP (YCOA)", "Kameralistik (Kommune)"],
+    horizontal=True,
+    on_change=on_erp_system_change  # <--- DIESER CALLBACK LÖST BEIDE PROBLEME!
+)
+
+# Dynamischer Ladeprozess basierend auf der frischen Auswahl
+ACTIVE_KONTENSTAMM = load_chart_of_accounts_by_system(target_system)
+
+# Dynamischer Ladeprozess basierend auf der Auswahl
+ACTIVE_KONTENSTAMM = load_chart_of_accounts_by_system(target_system)
 
 with st.sidebar:
-    st.header("Vollständige SKR03-Stammdaten")
-    df_visual = pd.DataFrame(ALL_SKR03_KONTEN)[["konto", "bezeichnung", "beschreibung"]]
+    st.header(f"Stammdaten: {target_system}")
+    df_visual = pd.DataFrame(ACTIVE_KONTENSTAMM)[["konto", "bezeichnung", "beschreibung"]]
     st.dataframe(df_visual, use_container_width=True)
 
 # --- SESSION STATE INITIALISIERUNG ---
 if "demo_active" not in st.session_state:
     st.session_state["demo_active"] = False
 
-# Zwei Spalten für flexiblen Einstieg: Manueller Upload ODER Demo-Trigger
 col_up, col_demo = st.columns([2, 1])
 
 with col_up:
@@ -303,20 +313,19 @@ with col_up:
         type=["xml", "pdf"]
     )
     if uploaded_file is not None:
-        st.session_state["demo_active"] = False  # Demo deaktivieren, wenn manuell geladen wird
+        st.session_state["demo_active"] = False
 
 with col_demo:
     st.write("Keine E-Rechnung zur Hand?")
     if st.button("🚀 Live-Demo-Daten laden", use_container_width=True):
         st.session_state["demo_active"] = True
 
-# Logik zur Bestimmung der Datenquelle
 xml_source = None
 file_name_label = ""
 
 if uploaded_file is not None:
     xml_source = uploaded_file
-    file_name_label = uploaded_file.name
+    file_name_label = f"{target_system}_{uploaded_file.name}"
     if uploaded_file.name.endswith(".pdf"):
         with st.spinner("Extrahiere ZUGFeRD-XML aus PDF..."):
             xml_bytes = extract_xml_from_zugferd(uploaded_file)
@@ -332,12 +341,11 @@ elif st.session_state["demo_active"]:
     if os.path.exists(demo_path):
         with open(demo_path, "rb") as f:
             xml_source = io.BytesIO(f.read())
-        file_name_label = "steuerberater_DEMO.xml"
-        st.success("🤖 Demo-Modus aktiv: Test-Rechnung 'Dr. Steuer & Partner' geladen!")
+        file_name_label = f"{target_system}_steuerberater_DEMO.xml"
+        st.success("🤖 Demo-Modus aktiv: Test-Rechnung geladen!")
     else:
         st.error("Demo-Datei nicht im Verzeichnis gefunden.")
 
-# Nur ausführen, wenn eine Quelle (Upload oder Demo) existiert
 if xml_source is not None:
     try:
         vendor, lines, totals = parse_e_invoice_xml(xml_source)
@@ -356,11 +364,11 @@ if xml_source is not None:
                     st.success(log)
         
         if is_error:
-            st.error("⚠️ KI-Verarbeitung gestoppt, da die Rechnung formale oder rechnerische Fehler aufweist.")
+            st.error("⚠️ KI-Verarbeitung gestoppt aufgrund formaler Rechnungsfehler.")
             st.stop()
             
         # --- SCHRITT 2: KI KONTIERUNG ---
-        st.write("### 🤖 Schritt 2: Extrahierte Positionen & KI-Verarbeitung (RAG-optimiert)")
+        st.write(f"### 🤖 Schritt 2: Extrahierte Positionen & KI-Routing nach {target_system}")
         
         if "processing_cache" not in st.session_state or st.session_state.get("current_file") != file_name_label:
             st.session_state["processing_cache"] = []
@@ -368,15 +376,18 @@ if xml_source is not None:
             
             with st.spinner("RAG-Engine sucht passende Konten via Semantik & KI analysiert..."):
                 for item in lines:
-                    gefilterte_konten = get_relevant_accounts(item["description"], top_n=3)
+                    gefilterte_konten = get_relevant_accounts(item["description"], ACTIVE_KONTENSTAMM, top_n=3)
+                    top_score = gefilterte_konten[0]["similarity_score"]
+                    
                     ki_res = get_ki_kontierung(item, vendor, gefilterte_konten)
-                    is_valid, msg = validate_kontierung(ki_res)
+                    is_valid, msg = validate_kontierung(ki_res, ACTIVE_KONTENSTAMM)
                     
                     st.session_state["processing_cache"].append({
                         "item": item,
                         "ki_res": ki_res,
                         "is_valid": is_valid,
                         "msg": msg,
+                        "confidence_score": top_score,
                         "gefilterte_konten": gefilterte_konten
                     })
 
@@ -397,7 +408,14 @@ if xml_source is not None:
                 
                 with col2:
                     if is_valid:
-                        st.metric(label="Vorgeschlagenes Konto", value=str(ki_res['konto_soll']))
+                        st.metric(label="Zugeordnetes Konto", value=str(ki_res['konto_soll']))
+                        score = cached_item.get("confidence_score", 0.0)
+                        
+                        if score >= 0.35:
+                            st.markdown(f"🟢 **Vorkontiert** *(Konfidenz: {score:.2f})*")
+                        else:
+                            st.markdown(f"🟡 **Prüfung empfohlen** *(Konfidenz: {score:.2f})*")
+                            
                         validierte_buchungen_liste.append({
                             "netto": item['amount'],
                             "konto_soll": ki_res['konto_soll'],
@@ -413,14 +431,31 @@ if xml_source is not None:
         
         if validierte_buchungen_liste:
             st.write("### 🚀 Schritt 3: Prozess abschließen")
-            datev_csv_content = create_datev_csv(validierte_buchungen_liste)
-            st.download_button(
-                label="Kontierung übernehmen und Export nach DATEV",
-                data=datev_csv_content,
-                file_name="DATEV_Buchungsstapel_Export.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+            
+            if "DATEV" in target_system:
+                datev_csv_content = create_datev_csv(validierte_buchungen_liste)
+                st.download_button(
+                    label="Kontierung übernehmen und Export nach DATEV (EXTF)",
+                    data=datev_csv_content,
+                    file_name="DATEV_Buchungsstapel_Export.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                # Dynamisches generisches Layout für SAP / Kameralistik
+                df_export = pd.DataFrame(validierte_buchungen_liste)
+                df_export.columns = ["Netto-Betrag", "Ziel-Konto/Titel", "Buchungstext", "MwSt-%"]
+                csv_buffer = io.StringIO()
+                df_export.to_csv(csv_buffer, index=False, sep=";")
+                
+                st.download_button(
+                    label=f"Kontierung übernehmen und Export für {target_system}",
+                    data=csv_buffer.getvalue(),
+                    file_name=f"{target_system.replace(' ', '_')}_Export.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+                st.dataframe(df_export, use_container_width=True)
                 
     except Exception as e:
         st.error(f"Fehler beim Verarbeiten der Struktur: {e}")
