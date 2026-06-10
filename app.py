@@ -301,9 +301,12 @@ def on_erp_system_change():
 analytics_active = HAS_ANALYTICS
 
 if HAS_ANALYTICS:
-    # Wir holen das Passwort sicher aus den Streamlit Secrets. 
-    # Lokal nutzen wir ein Dummy-Passwort, in der Cloud dein echtes.
-    cloud_password = st.secrets.get("ANALYTICS_PASSWORD", "lokal_dummy_pass")
+    # Defensiver Abfangmechanismus für Streamlits träges Secret-Parsing
+    try:
+        cloud_password = st.secrets.get("ANALYTICS_PASSWORD", "lokal_dummy_pass")
+    except Exception:
+        # Greift lokal, wenn überhaupt keine secrets.toml existiert
+        cloud_password = "lokal_dummy_pass"
     
     if "analytics" in st.query_params and st.query_params["analytics"] == "on":
         analytics_context = streamlit_analytics.track(unsafe_password=cloud_password)
