@@ -7,6 +7,24 @@ import os
 import numpy as np
 from openai import OpenAI
 from pypdf import PdfReader
+import contextlib  # <--- Für den Null-Kontext-Fallback
+
+# Kaskadierender Import für absolute Kompatibilität mit dem Fork
+HAS_ANALYTICS = False
+streamlit_analytics = None
+
+try:
+    import streamlit_analytics2 as streamlit_analytics
+    HAS_ANALYTICS = True
+    print("[INFO] Modernes streamlit_analytics2 erfolgreich geladen.")
+except ModuleNotFoundError:
+    try:
+        import streamlit_analytics
+        HAS_ANALYTICS = True
+        print("[INFO] Klassisches streamlit_analytics erfolgreich geladen.")
+    except ModuleNotFoundError:
+        HAS_ANALYTICS = False
+        print("[WARN] Kein Analytics-Modul gefunden. Nutze passiven Fallback-Modus.")
 
 st.set_page_config(page_title="AI Kontierungs-Engine MVP", page_icon="📊", layout="wide")
 
@@ -279,184 +297,200 @@ def on_erp_system_change():
     st.session_state["demo_active"] = False
 
 # --- UI LAYOUT ---
-st.title("📊 Autonome E-Rechnungs-Engine")
-st.subheader("Cross-Platform Multi-ERP Routing Engine für Corporate Governance")
+# Fallback-Sicherung und expliziter Check für Streamlit v1.58.0 Query-Schnittstelle
+analytics_active = HAS_ANALYTICS
 
-# --- SYSTEM AUSWAHL (Jetzt mit automatischem GUI-Reset bei Umschaltung) ---
-target_system = st.radio(
-    "🎯 Wählen Sie das Ziel-ERP / Rechnungslegungssystem für das automatische Routing:",
-    ["DATEV (SKR03)", "SAP (YCOA)", "Kameralistik (Kommune)"],
-    horizontal=True,
-    on_change=on_erp_system_change  # <--- DIESER CALLBACK LÖST BEIDE PROBLEME!
-)
+if HAS_ANALYTICS:
+    # Wir holen das Passwort sicher aus den Streamlit Secrets. 
+    # Lokal nutzen wir ein Dummy-Passwort, in der Cloud dein echtes.
+    cloud_password = st.secrets.get("ANALYTICS_PASSWORD", "lokal_dummy_pass")
+    
+    if "analytics" in st.query_params and st.query_params["analytics"] == "on":
+        analytics_context = streamlit_analytics.track(unsafe_password=cloud_password)
+    else:
+        analytics_context = streamlit_analytics.track()
+else:
+    analytics_context = contextlib.nullcontext()
 
-# Dynamischer Ladeprozess basierend auf der frischen Auswahl
-ACTIVE_KONTENSTAMM = load_chart_of_accounts_by_system(target_system)
+with analytics_context:
+    st.title("📊 Autonome E-Rechnungs-Engine")
+    st.subheader("Cross-Platform Multi-ERP Routing Engine für Corporate Governance")
 
-# Dynamischer Ladeprozess basierend auf der Auswahl
-ACTIVE_KONTENSTAMM = load_chart_of_accounts_by_system(target_system)
-
-with st.sidebar:
-    st.header(f"Stammdaten: {target_system}")
-    df_visual = pd.DataFrame(ACTIVE_KONTENSTAMM)[["konto", "bezeichnung", "beschreibung"]]
-    st.dataframe(df_visual, use_container_width=True)
-
-# --- SESSION STATE INITIALISIERUNG ---
-if "demo_active" not in st.session_state:
-    st.session_state["demo_active"] = False
-
-col_up, col_demo = st.columns([2, 1])
-
-with col_up:
-    uploaded_file = st.file_uploader(
-        "1. Eigene E-Rechnung hochladen (XRechnung XML oder ZUGFeRD PDF)", 
-        type=["xml", "pdf"]
+    # --- SYSTEM AUSWAHL (Jetzt mit automatischem GUI-Reset bei Umschaltung) ---
+    target_system = st.radio(
+        "🎯 Wählen Sie das Ziel-ERP / Rechnungslegungssystem für das automatische Routing:",
+        ["DATEV (SKR03)", "SAP (YCOA)", "Kameralistik (Kommune)"],
+        horizontal=True,
+        on_change=on_erp_system_change  # <--- DIESER CALLBACK LÖST BEIDE PROBLEME!
     )
-    if uploaded_file is not None:
+
+    # Dynamischer Ladeprozess basierend auf der frischen Auswahl
+    ACTIVE_KONTENSTAMM = load_chart_of_accounts_by_system(target_system)
+
+    # Dynamischer Ladeprozess basierend auf der Auswahl
+    ACTIVE_KONTENSTAMM = load_chart_of_accounts_by_system(target_system)
+
+    with st.sidebar:
+        st.header(f"Stammdaten: {target_system}")
+        df_visual = pd.DataFrame(ACTIVE_KONTENSTAMM)[["konto", "bezeichnung", "beschreibung"]]
+        st.dataframe(df_visual, use_container_width=True)
+
+    # --- SESSION STATE INITIALISIERUNG ---
+    if "demo_active" not in st.session_state:
         st.session_state["demo_active"] = False
 
-with col_demo:
-    st.write("Keine E-Rechnung zur Hand?")
-    if st.button("🚀 Live-Demo-Daten laden", use_container_width=True):
-        st.session_state["demo_active"] = True
+    col_up, col_demo = st.columns([2, 1])
 
-xml_source = None
-file_name_label = ""
+    with col_up:
+        uploaded_file = st.file_uploader(
+            "1. Eigene E-Rechnung hochladen (XRechnung XML oder ZUGFeRD PDF)", 
+            type=["xml", "pdf"]
+        )
+        if uploaded_file is not None:
+            st.session_state["demo_active"] = False
 
-if uploaded_file is not None:
-    xml_source = uploaded_file
-    file_name_label = f"{target_system}_{uploaded_file.name}"
-    if uploaded_file.name.endswith(".pdf"):
-        with st.spinner("Extrahiere ZUGFeRD-XML aus PDF..."):
-            xml_bytes = extract_xml_from_zugferd(uploaded_file)
-        if xml_bytes:
-            xml_source = io.BytesIO(xml_bytes)
-            st.info("ZUGFeRD-XML erfolgreich extrahiert!")
-        else:
-            st.error("Keine gültige ZUGFeRD-XML-Struktur in dieser PDF gefunden.")
-            st.stop()
+    with col_demo:
+        st.write("Keine E-Rechnung zur Hand?")
+        if st.button("🚀 Live-Demo-Daten laden", use_container_width=True):
+            st.session_state["demo_active"] = True
 
-elif st.session_state["demo_active"]:
-    demo_path = "test_invoices/steuerberater.xml"
-    if os.path.exists(demo_path):
-        with open(demo_path, "rb") as f:
-            xml_source = io.BytesIO(f.read())
-        file_name_label = f"{target_system}_steuerberater_DEMO.xml"
-        st.success("🤖 Demo-Modus aktiv: Test-Rechnung geladen!")
-    else:
-        st.error("Demo-Datei nicht im Verzeichnis gefunden.")
+    xml_source = None
+    file_name_label = ""
 
-if xml_source is not None:
-    try:
-        vendor, lines, totals = parse_e_invoice_xml(xml_source)
-        st.success(f"Rechnung erfolgreich eingelesen! **Kreditor:** {vendor}")
-        
-        # --- SCHRITT 1: FORMALE & RECHNERISCHE PRÜFUNG ---
-        st.write("### 🧮 Schritt 1: Formale & Rechnerische Feststellung")
-        math_status, math_logs = check_invoice_math(lines, totals)
-        
-        is_error = (math_status != "RECHNERISCHE PRÜFUNG ERFOLGREICH")
-        with st.expander(f"Prüfprotokoll anzeigen ({math_status})", expanded=is_error):
-            for log in math_logs:
-                if "❌" in log:
-                    st.error(log)
-                else:
-                    st.success(log)
-        
-        if is_error:
-            st.error("⚠️ KI-Verarbeitung gestoppt aufgrund formaler Rechnungsfehler.")
-            st.stop()
-            
-        # --- SCHRITT 2: KI KONTIERUNG ---
-        st.write(f"### 🤖 Schritt 2: Extrahierte Positionen & KI-Routing nach {target_system}")
-        
-        if "processing_cache" not in st.session_state or st.session_state.get("current_file") != file_name_label:
-            st.session_state["processing_cache"] = []
-            st.session_state["current_file"] = file_name_label
-            
-            with st.spinner("RAG-Engine sucht passende Konten via Semantik & KI analysiert..."):
-                for item in lines:
-                    gefilterte_konten = get_relevant_accounts(item["description"], ACTIVE_KONTENSTAMM, top_n=3)
-                    top_score = gefilterte_konten[0]["similarity_score"]
-                    
-                    ki_res = get_ki_kontierung(item, vendor, gefilterte_konten)
-                    is_valid, msg = validate_kontierung(ki_res, ACTIVE_KONTENSTAMM)
-                    
-                    st.session_state["processing_cache"].append({
-                        "item": item,
-                        "ki_res": ki_res,
-                        "is_valid": is_valid,
-                        "msg": msg,
-                        "confidence_score": top_score,
-                        "gefilterte_konten": gefilterte_konten
-                    })
-
-        validierte_buchungen_liste = []
-        for index, cached_item in enumerate(st.session_state["processing_cache"]):
-            item = cached_item["item"]
-            ki_res = cached_item["ki_res"]
-            is_valid = cached_item["is_valid"]
-            msg = cached_item["msg"]
-            opt = cached_item["gefilterte_konten"]
-            
-            with st.container():
-                col1, col2, col3 = st.columns([2, 1, 2])
-                with col1:
-                    st.markdown(f"**Pos {item['id']}:** {item['description']}")
-                    st.caption(f"Netto-Betrag: {item['amount']:.2f} EUR | 📝 Steuersatz: {item['tax_percent']}%")
-                    st.caption(f"💡 *RAG-Vektor-Top-3: {', '.join([str(k['konto']) for k in opt])}*")
-                
-                with col2:
-                    if is_valid:
-                        st.metric(label="Zugeordnetes Konto", value=str(ki_res['konto_soll']))
-                        score = cached_item.get("confidence_score", 0.0)
-                        
-                        if score >= 0.35:
-                            st.markdown(f"🟢 **Vorkontiert** *(Konfidenz: {score:.2f})*")
-                        else:
-                            st.markdown(f"🟡 **Prüfung empfohlen** *(Konfidenz: {score:.2f})*")
-                            
-                        validierte_buchungen_liste.append({
-                            "netto": item['amount'],
-                            "konto_soll": ki_res['konto_soll'],
-                            "beschreibung": f"{vendor}: {item['description']}",
-                            "tax_percent": item['tax_percent']
-                        })
-                    else:
-                        st.error(f"Fehler: {msg}")
-                
-                with col3:
-                    st.text_area("Buchungstext / Begründung", value=ki_res['begruendung'], key=f"text_{item['id']}_{index}", height=68)
-                st.divider()  
-        
-        if validierte_buchungen_liste:
-            st.write("### 🚀 Schritt 3: Prozess abschließen")
-            
-            if "DATEV" in target_system:
-                datev_csv_content = create_datev_csv(validierte_buchungen_liste)
-                st.download_button(
-                    label="Kontierung übernehmen und Export nach DATEV (EXTF)",
-                    data=datev_csv_content,
-                    file_name="DATEV_Buchungsstapel_Export.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+    if uploaded_file is not None:
+        xml_source = uploaded_file
+        file_name_label = f"{target_system}_{uploaded_file.name}"
+        if uploaded_file.name.endswith(".pdf"):
+            with st.spinner("Extrahiere ZUGFeRD-XML aus PDF..."):
+                xml_bytes = extract_xml_from_zugferd(uploaded_file)
+            if xml_bytes:
+                xml_source = io.BytesIO(xml_bytes)
+                st.info("ZUGFeRD-XML erfolgreich extrahiert!")
             else:
-                # Dynamisches generisches Layout für SAP / Kameralistik
-                df_export = pd.DataFrame(validierte_buchungen_liste)
-                df_export.columns = ["Netto-Betrag", "Ziel-Konto/Titel", "Buchungstext", "MwSt-%"]
-                csv_buffer = io.StringIO()
-                df_export.to_csv(csv_buffer, index=False, sep=";")
+                st.error("Keine gültige ZUGFeRD-XML-Struktur in dieser PDF gefunden.")
+                st.stop()
+
+    elif st.session_state["demo_active"]:
+        demo_path = "test_invoices/steuerberater.xml"
+        if os.path.exists(demo_path):
+            with open(demo_path, "rb") as f:
+                xml_source = io.BytesIO(f.read())
+            file_name_label = f"{target_system}_steuerberater_DEMO.xml"
+            st.success("🤖 Demo-Modus aktiv: Test-Rechnung geladen!")
+        else:
+            st.error("Demo-Datei nicht im Verzeichnis gefunden.")
+
+    if xml_source is not None:
+        try:
+            vendor, lines, totals = parse_e_invoice_xml(xml_source)
+            st.success(f"Rechnung erfolgreich eingelesen! **Kreditor:** {vendor}")
+            
+            # --- SCHRITT 1: FORMALE & RECHNERISCHE PRÜFUNG ---
+            st.write("### 🧮 Schritt 1: Formale & Rechnerische Feststellung")
+            math_status, math_logs = check_invoice_math(lines, totals)
+            
+            is_error = (math_status != "RECHNERISCHE PRÜFUNG ERFOLGREICH")
+            with st.expander(f"Prüfprotokoll anzeigen ({math_status})", expanded=is_error):
+                for log in math_logs:
+                    if "❌" in log:
+                        st.error(log)
+                    else:
+                        st.success(log)
+            
+            if is_error:
+                st.error("⚠️ KI-Verarbeitung gestoppt aufgrund formaler Rechnungsfehler.")
+                st.stop()
                 
-                st.download_button(
-                    label=f"Kontierung übernehmen und Export für {target_system}",
-                    data=csv_buffer.getvalue(),
-                    file_name=f"{target_system.replace(' ', '_')}_Export.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-                st.dataframe(df_export, use_container_width=True)
+            # --- SCHRITT 2: KI KONTIERUNG ---
+            st.write(f"### 🤖 Schritt 2: Extrahierte Positionen & KI-Routing nach {target_system}")
+            
+            if "processing_cache" not in st.session_state or st.session_state.get("current_file") != file_name_label:
+                st.session_state["processing_cache"] = []
+                st.session_state["current_file"] = file_name_label
                 
-    except Exception as e:
-        st.error(f"Fehler beim Verarbeiten der Struktur: {e}")
+                with st.spinner("RAG-Engine sucht passende Konten via Semantik & KI analysiert..."):
+                    for item in lines:
+                        gefilterte_konten = get_relevant_accounts(item["description"], ACTIVE_KONTENSTAMM, top_n=3)
+                        top_score = gefilterte_konten[0]["similarity_score"]
+                        
+                        ki_res = get_ki_kontierung(item, vendor, gefilterte_konten)
+                        is_valid, msg = validate_kontierung(ki_res, ACTIVE_KONTENSTAMM)
+                        
+                        st.session_state["processing_cache"].append({
+                            "item": item,
+                            "ki_res": ki_res,
+                            "is_valid": is_valid,
+                            "msg": msg,
+                            "confidence_score": top_score,
+                            "gefilterte_konten": gefilterte_konten
+                        })
+
+            validierte_buchungen_liste = []
+            for index, cached_item in enumerate(st.session_state["processing_cache"]):
+                item = cached_item["item"]
+                ki_res = cached_item["ki_res"]
+                is_valid = cached_item["is_valid"]
+                msg = cached_item["msg"]
+                opt = cached_item["gefilterte_konten"]
+                
+                with st.container():
+                    col1, col2, col3 = st.columns([2, 1, 2])
+                    with col1:
+                        st.markdown(f"**Pos {item['id']}:** {item['description']}")
+                        st.caption(f"Netto-Betrag: {item['amount']:.2f} EUR | 📝 Steuersatz: {item['tax_percent']}%")
+                        st.caption(f"💡 *RAG-Vektor-Top-3: {', '.join([str(k['konto']) for k in opt])}*")
+                    
+                    with col2:
+                        if is_valid:
+                            st.metric(label="Zugeordnetes Konto", value=str(ki_res['konto_soll']))
+                            score = cached_item.get("confidence_score", 0.0)
+                            
+                            if score >= 0.35:
+                                st.markdown(f"🟢 **Vorkontiert** *(Konfidenz: {score:.2f})*")
+                            else:
+                                st.markdown(f"🟡 **Prüfung empfohlen** *(Konfidenz: {score:.2f})*")
+                                
+                            validierte_buchungen_liste.append({
+                                "netto": item['amount'],
+                                "konto_soll": ki_res['konto_soll'],
+                                "beschreibung": f"{vendor}: {item['description']}",
+                                "tax_percent": item['tax_percent']
+                            })
+                        else:
+                            st.error(f"Fehler: {msg}")
+                    
+                    with col3:
+                        st.text_area("Buchungstext / Begründung", value=ki_res['begruendung'], key=f"text_{item['id']}_{index}", height=68)
+                    st.divider()  
+            
+            if validierte_buchungen_liste:
+                st.write("### 🚀 Schritt 3: Prozess abschließen")
+                
+                if "DATEV" in target_system:
+                    datev_csv_content = create_datev_csv(validierte_buchungen_liste)
+                    st.download_button(
+                        label="Kontierung übernehmen und Export nach DATEV (EXTF)",
+                        data=datev_csv_content,
+                        file_name="DATEV_Buchungsstapel_Export.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                else:
+                    # Dynamisches generisches Layout für SAP / Kameralistik
+                    df_export = pd.DataFrame(validierte_buchungen_liste)
+                    df_export.columns = ["Netto-Betrag", "Ziel-Konto/Titel", "Buchungstext", "MwSt-%"]
+                    csv_buffer = io.StringIO()
+                    df_export.to_csv(csv_buffer, index=False, sep=";")
+                    
+                    st.download_button(
+                        label=f"Kontierung übernehmen und Export für {target_system}",
+                        data=csv_buffer.getvalue(),
+                        file_name=f"{target_system.replace(' ', '_')}_Export.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                    st.dataframe(df_export, use_container_width=True)
+                    
+        except Exception as e:
+            st.error(f"Fehler beim Verarbeiten der Struktur: {e}")
 
