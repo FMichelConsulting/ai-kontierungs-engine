@@ -33,6 +33,31 @@ try:
 except Exception:
     client = None
 
+# ==============================================================================
+# PERSISTENZ-LAYER (Human-in-the-Loop Wissensdatenbank)
+# ==============================================================================
+OVERRIDES_FILE = "user_overrides.json"
+
+def load_user_overrides():
+    """Lädt die vom User trainierten Konten-Zuweisungen."""
+    if os.path.exists(OVERRIDES_FILE):
+        try:
+            with open(OVERRIDES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_user_override(buchungstext, korrigiertes_konto):
+    """Speichert eine manuelle Korrektur persistent ab."""
+    overrides = load_user_overrides()
+    overrides[buchungstext] = korrigiertes_konto
+    try:
+        with open(OVERRIDES_FILE, "w", encoding="utf-8") as f:
+            json.dump(overrides, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        st.error(f"Fehler beim Speichern des Overrides: {e}")
+        
 # --- MATHEMATISCHE UTILS FÜR SEMANTISCHE VEKTORSUCHE (RAG) ---
 def get_embedding(text, model="text-embedding-3-small"):
     """Erzeugt einen semantischen Vektor für einen gegebenen Text über die OpenAI-API."""
@@ -293,19 +318,15 @@ def on_erp_system_change():
         del st.session_state["processing_cache"]
     if "current_file" in st.session_state:
         del st.session_state["current_file"]
-    # Schaltet den automatischen Demo-Modus ab, damit die App auf Input wartet
     st.session_state["demo_active"] = False
 
 # --- UI LAYOUT ---
-# Fallback-Sicherung und expliziter Check für Streamlit v1.58.0 Query-Schnittstelle
 analytics_active = HAS_ANALYTICS
 
 if HAS_ANALYTICS:
-    # Defensiver Abfangmechanismus für Streamlits träges Secret-Parsing
     try:
         cloud_password = st.secrets.get("ANALYTICS_PASSWORD", "lokal_dummy_pass")
     except Exception:
-        # Greift lokal, wenn überhaupt keine secrets.toml existiert
         cloud_password = "lokal_dummy_pass"
     
     if "analytics" in st.query_params and st.query_params["analytics"] == "on":
@@ -319,18 +340,14 @@ with analytics_context:
     st.title("📊 Autonome E-Rechnungs-Engine")
     st.subheader("Cross-Platform Multi-ERP Routing Engine für Corporate Governance")
 
-    # --- SYSTEM AUSWAHL (Jetzt mit automatischem GUI-Reset bei Umschaltung) ---
+    # --- SYSTEM AUSWAHL ---
     target_system = st.radio(
         "🎯 Wählen Sie das Ziel-ERP / Rechnungslegungssystem für das automatische Routing:",
         ["DATEV (SKR03)", "SAP (YCOA)", "Kameralistik (Kommune)"],
         horizontal=True,
-        on_change=on_erp_system_change  # <--- DIESER CALLBACK LÖST BEIDE PROBLEME!
+        on_change=on_erp_system_change
     )
 
-    # Dynamischer Ladeprozess basierend auf der frischen Auswahl
-    ACTIVE_KONTENSTAMM = load_chart_of_accounts_by_system(target_system)
-
-    # Dynamischer Ladeprozess basierend auf der Auswahl
     ACTIVE_KONTENSTAMM = load_chart_of_accounts_by_system(target_system)
 
     with st.sidebar:
@@ -338,7 +355,6 @@ with analytics_context:
         df_visual = pd.DataFrame(ACTIVE_KONTENSTAMM)[["konto", "bezeichnung", "beschreibung"]]
         st.dataframe(df_visual, use_container_width=True)
 
-    # --- SESSION STATE INITIALISIERUNG ---
     if "demo_active" not in st.session_state:
         st.session_state["demo_active"] = False
 
@@ -404,8 +420,9 @@ with analytics_context:
                 st.error("⚠️ KI-Verarbeitung gestoppt aufgrund formaler Rechnungsfehler.")
                 st.stop()
                 
-            # --- SCHRITT 2: KI KONTIERUNG ---
+            # --- SCHRITT 2: KI KONTIERUNG & INTERAKTIVES OVERRIDE ---
             st.write(f"### 🤖 Schritt 2: Extrahierte Positionen & KI-Routing nach {target_system}")
+            st.info("💡 **Motto: Fachexperte schlägt KI.** Jedes vorgeschlagene Konto kann über das Dropdown-Feld manuell überschrieben werden. Das System lernt aktiv mit.")
             
             if "processing_cache" not in st.session_state or st.session_state.get("current_file") != file_name_label:
                 st.session_state["processing_cache"] = []
@@ -428,46 +445,101 @@ with analytics_context:
                             "gefilterte_konten": gefilterte_konten
                         })
 
+            # Stammdaten-Struktur für die Dropdown-Vorbereitung indizieren
+            available_accounts = [k["konto"] for k in ACTIVE_KONTENSTAMM]
+            account_labels = {k["konto"]: f"{k['konto']} - {k['bezeichnung']}" for k in ACTIVE_KONTENSTAMM}
+            user_overrides = load_user_overrides()
+
             validierte_buchungen_liste = []
+            
             for index, cached_item in enumerate(st.session_state["processing_cache"]):
                 item = cached_item["item"]
                 ki_res = cached_item["ki_res"]
                 is_valid = cached_item["is_valid"]
                 msg = cached_item["msg"]
                 opt = cached_item["gefilterte_konten"]
+                score = cached_item.get("confidence_score", 0.0)
+                
+                text_key = item["description"]
+                ai_acc = ki_res.get("konto_soll")
+                
+                # Prüfung auf historische Anpassungen durch den User (Lernspeicher)
+                has_history = text_key in user_overrides
+                default_account = user_overrides[text_key] if has_history else ai_acc
+                
+                # Typkonvertierung falls JSON-Keys als String interpretiert wurden
+                if isinstance(default_account, str) and default_account.isdigit():
+                    default_account = int(default_account)
+                
+                if default_account not in available_accounts:
+                    default_account = available_accounts[0] if available_accounts else ai_acc
                 
                 with st.container():
-                    col1, col2, col3 = st.columns([2, 1, 2])
+                    col1, col2, col3 = st.columns([3, 2, 3])
                     with col1:
                         st.markdown(f"**Pos {item['id']}:** {item['description']}")
                         st.caption(f"Netto-Betrag: {item['amount']:.2f} EUR | 📝 Steuersatz: {item['tax_percent']}%")
                         st.caption(f"💡 *RAG-Vektor-Top-3: {', '.join([str(k['konto']) for k in opt])}*")
                     
                     with col2:
-                        if is_valid:
-                            st.metric(label="Zugeordnetes Konto", value=str(ki_res['konto_soll']))
-                            score = cached_item.get("confidence_score", 0.0)
-                            
-                            if score >= 0.35:
-                                st.markdown(f"🟢 **Vorkontiert** *(Konfidenz: {score:.2f})*")
-                            else:
-                                st.markdown(f"🟡 **Prüfung empfohlen** *(Konfidenz: {score:.2f})*")
-                                
-                            validierte_buchungen_liste.append({
-                                "netto": item['amount'],
-                                "konto_soll": ki_res['konto_soll'],
-                                "beschreibung": f"{vendor}: {item['description']}",
-                                "tax_percent": item['tax_percent']
-                            })
-                        else:
+                        if not is_valid:
                             st.error(f"Fehler: {msg}")
+                            selected_acc = ai_acc
+                            protokoll = f"Ungültige KI-Rückgabe: {msg}"
+                        else:
+                            # Das interaktive UI-Gateway für den Fachexperten (Option A)
+                            selected_acc = st.selectbox(
+                                f"Ziel-Konto anpassen (Pos {item['id']}):",
+                                options=available_accounts,
+                                index=available_accounts.index(default_account) if default_account in available_accounts else 0,
+                                format_func=lambda x: account_labels.get(x, str(x)),
+                                key=f"select_pos_{item['id']}_{index}"
+                            )
+                            
+                            # Logik-Engine zur Feststellung der Herkunft (Audit Trail)
+                            if selected_acc != ai_acc:
+                                if has_history and selected_acc == user_overrides[text_key]:
+                                    protokoll = f"Historisches User-Konto genutzt (KI empfahl ursprünglich {ai_acc})"
+                                else:
+                                    protokoll = f"Manuell korrigiert (KI empfahl {ai_acc} mit Conf {score:.2f})"
+                                    if text_key not in user_overrides or user_overrides[text_key] != selected_acc:
+                                        save_user_override(text_key, selected_acc)
+                            else:
+                                if has_history:
+                                    protokoll = f"Historisches User-Konto genutzt (Identisch mit KI-Vorschlag)"
+                                else:
+                                    protokoll = f"Automatisch kontiert via KI (Conf: {score:.2f})"
+                            
+                            # Status-Badge rendern
+                            if has_history:
+                                st.success("🔄 Historisch gelernt")
+                            elif score >= 0.35:
+                                st.success(f"🟢 KI Sicher")
+                            else:
+                                st.warning(f"🟡 Prüfung empfohlen")
+                                
+                        # Für das nachfolgende Export-Array aggregieren
+                        validierte_buchungen_liste.append({
+                            "netto": item['amount'],
+                            "konto_soll": selected_acc,
+                            "beschreibung": f"{vendor}: {item['description']}",
+                            "tax_percent": item['tax_percent'],
+                            "audit_trail": protokoll
+                        })
                     
                     with col3:
-                        st.text_area("Buchungstext / Begründung", value=ki_res['begruendung'], key=f"text_{item['id']}_{index}", height=68)
-                    st.divider()  
+                        st.text_area("KI-Originalbegründung (Read-Only)", value=ki_res.get('begruendung', ''), key=f"text_{item['id']}_{index}", height=68, disabled=True)
+                st.divider()  
             
+            # --- SCHRITT 3: COMPLIANCE EXPORT & AUDIT TRAIL ---
             if validierte_buchungen_liste:
                 st.write("### 🚀 Schritt 3: Prozess abschließen")
+                
+                # Vorab-Anzeige des DataFrames inklusive des dynamischen Audit Trails
+                df_export = pd.DataFrame(validierte_buchungen_liste)
+                df_export.columns = ["Netto-Betrag", "Ziel-Konto/Titel", "Buchungstext", "MwSt-%", "Audit-Trail / Protokoll"]
+                st.write("#### 📋 Vorschau der zu exportierenden Buchungssätze:")
+                st.dataframe(df_export, use_container_width=True)
                 
                 if "DATEV" in target_system:
                     datev_csv_content = create_datev_csv(validierte_buchungen_liste)
@@ -479,11 +551,9 @@ with analytics_context:
                         use_container_width=True
                     )
                 else:
-                    # Dynamisches generisches Layout für SAP / Kameralistik
-                    df_export = pd.DataFrame(validierte_buchungen_liste)
-                    df_export.columns = ["Netto-Betrag", "Ziel-Konto/Titel", "Buchungstext", "MwSt-%"]
+                    # Generischer Export für SAP (YCOA) und Kameralistik
                     csv_buffer = io.StringIO()
-                    df_export.to_csv(csv_buffer, index=False, sep=";")
+                    df_export.to_csv(csv_buffer, index=False, sep=";", encoding="utf-8-sig")
                     
                     st.download_button(
                         label=f"Kontierung übernehmen und Export für {target_system}",
@@ -492,8 +562,6 @@ with analytics_context:
                         mime="text/csv",
                         use_container_width=True
                     )
-                    st.dataframe(df_export, use_container_width=True)
                     
         except Exception as e:
             st.error(f"Fehler beim Verarbeiten der Struktur: {e}")
-
