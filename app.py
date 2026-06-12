@@ -7,10 +7,10 @@ import os
 import numpy as np
 from openai import OpenAI
 from pypdf import PdfReader
-import contextlib  # <--- Für den Null-Kontext-Fallback
-from supabase import create_client, Client  # <--- Offizieller Supabase-Infrastruktur-Client
+import contextlib
+from supabase import create_client, Client
 
-# Kaskadierender Import für absolute Kompatibilität mit dem Fork
+# Kaskadierender Import für absolute Kompatibilität mit dem Analytics-Fork
 HAS_ANALYTICS = False
 streamlit_analytics = None
 
@@ -35,7 +35,7 @@ except Exception:
     client = None
 
 # ==============================================================================
-# SUPABASE DATABASE LAYER (GoBD-konformer Append-Only Ledger)
+# SUPABASE ENTERPRISE DATABASE LAYER (Mandantenfähig & pgvector-gestützt)
 # ==============================================================================
 @st.cache_resource
 def init_supabase() -> Client:
@@ -48,9 +48,9 @@ def init_supabase() -> Client:
         st.error(f"Supabase-Verbindungsfehler: Secrets unvollständig konfiguriert ({e})")
         return None
 
-def log_audit_event(item_key: str, event_type: str, konto_soll: int, actor: str, justification: str):
+def log_audit_event(company_id: str, item_key: str, event_type: str, konto_soll: int, actor: str, justification: str):
     """
-    Schreibt einen unveränderbaren Eintrag in das PostgreSQL-Audit-Log.
+    Schreibt einen unveränderbaren Eintrag inklusive Mandanten-ID in das PostgreSQL-Audit-Log.
     Die Inkrementierung der Spalte 'version' erfolgt atomar via DB-Trigger.
     """
     supabase = init_supabase()
@@ -58,6 +58,7 @@ def log_audit_event(item_key: str, event_type: str, konto_soll: int, actor: str,
         return
 
     event_data = {
+        "company_id": company_id,
         "item_key": item_key,
         "event_type": event_type,
         "konto_soll": int(konto_soll),
@@ -70,34 +71,42 @@ def log_audit_event(item_key: str, event_type: str, konto_soll: int, actor: str,
     except Exception as e:
         st.error(f"🚨 KRITISCHER COMPLIANCE-FEHLER: Audit-Log-Schreiben fehlgeschlagen: {e}")
 
-# ==============================================================================
-# PERSISTENZ-LAYER (Lokale Human-in-the-Loop Wissensdatenbank Fallback)
-# ==============================================================================
-OVERRIDES_FILE = "user_overrides.json"
-
-def load_user_overrides():
-    """Lädt die vom User trainierten Konten-Zuweisungen."""
-    if os.path.exists(OVERRIDES_FILE):
-        try:
-            with open(OVERRIDES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-def save_user_override(buchungstext, korrigiertes_konto):
-    """Speichert eine manuelle Korrektur persistent ab."""
-    overrides = load_user_overrides()
-    overrides[buchungstext] = korrigiertes_konto
+def load_user_override_from_db(company_id: str, buchungstext: str) -> int:
+    """Lädt die historische Korrektur für einen spezifischen Mandanten aus PostgreSQL."""
+    supabase = init_supabase()
+    if not supabase:
+        return None
     try:
-        with open(OVERRIDES_FILE, "w", encoding="utf-8") as f:
-            json.dump(overrides, f, ensure_ascii=False, indent=4)
+        res = supabase.table("user_knowledge_base")\
+            .select("konto_soll")\
+            .eq("company_id", company_id)\
+            .eq("buchungstext", buchungstext)\
+            .maybe_single()\
+            .execute()
+        return res.data["konto_soll"] if res.data else None
+    except Exception:
+        return None
+
+def save_user_override_to_db(company_id: str, buchungstext: str, korrigiertes_konto: int):
+    """Speichert eine manuelle Korrektur permanent und mandantenabhängig via SQL-Upsert."""
+    supabase = init_supabase()
+    if not supabase:
+        return
+    payload = {
+        "company_id": company_id,
+        "buchungstext": buchungstext,
+        "konto_soll": int(korrigiertes_konto)
+    }
+    try:
+        supabase.table("user_knowledge_base").upsert(payload, on_conflict="company_id,buchungstext").execute()
     except Exception as e:
-        st.error(f"Fehler beim Speichern des Overrides: {e}")
-        
-# --- MATHEMATISCHE UTILS FÜR SEMANTISCHE VEKTORSUCHE (RAG) ---
+        st.error(f"Fehler beim Speichern des Cloud-Overrides: {e}")
+
+# ==============================================================================
+# HARDENED RAG-RETRIEVER VIA PGVECTOR
+# ==============================================================================
 def get_embedding(text, model="text-embedding-3-small"):
-    """Erzeugt einen semantischen Vektor für einen gegebenen Text über die OpenAI-API."""
+    """Erzeugt einen semantischen Vektor für den Belegtext über die OpenAI-API."""
     if not client:
         return None
     text = text.replace("\n", " ")
@@ -108,43 +117,35 @@ def get_embedding(text, model="text-embedding-3-small"):
         st.error(f"Fehler bei der Embedding-Generierung: {e}")
         return None
 
-def cosine_similarity(a, b):
-    """Berechnet die mathematische Kosinus-Ähnlichkeit zwischen zwei Vektoren."""
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-def load_chart_of_accounts_by_system(system_name):
-    """Lädt den passenden Kontenrahmen inklusive Vektoren basierend auf dem Zielsystem."""
-    mapping = {
-        "DATEV (SKR03)": "skr03_with_embeddings.json",
-        "SAP (YCOA)": "sap_ycoa_with_embeddings.json",
-        "Kameralistik (Kommune)": "kameralistik_kommune_with_embeddings.json"
-    }
-    json_filename = mapping.get(system_name, "skr03_with_embeddings.json")
-    
-    if os.path.exists(json_filename):
-        with open(json_filename, "r", encoding="utf-8") as f:
-            return json.load(f)
-    else:
-        st.warning(f"Cache-Datei {json_filename} nicht gefunden! Nutze minimalen Fallback.")
-        return [{"konto": 9999, "bezeichnung": "Allgemeines Fallback-Konto", "beschreibung": "Fallback-Stamm", "embedding": None}]
-
-def get_relevant_accounts(item_description, current_accounts, top_n=3):
-    """Der RAG-Retriever sucht via Vektor-Ähnlichkeit passende Konten im aktuellen Stamm."""
-    item_embedding = get_embedding(item_description)
-    if not item_embedding:
-        return [{**k, "similarity_score": 0.0} for k in current_accounts[:top_n]]
+def get_relevant_accounts_pgvector(item_description: str, target_system: str, top_n=3):
+    """
+    Nutzt die native pgvector-Erweiterung von PostgreSQL für eine 
+    hochperformante Ähnlichkeitssuche direkt in der Cloud-Datenbank.
+    """
+    supabase = init_supabase()
+    if not supabase:
+        return []
         
-    scored_accounts = []
-    for k in current_accounts:
-        if k["embedding"] is not None:
-            score = cosine_similarity(item_embedding, k["embedding"])
-            konto_with_score = {**k, "similarity_score": float(score)}
-            scored_accounts.append(konto_with_score)
-            
-    scored_accounts.sort(key=lambda x: x["similarity_score"], reverse=True)
-    return scored_accounts[:top_n]
+    query_embedding = get_embedding(item_description)
+    if not query_embedding:
+        return []
+        
+    try:
+        response = supabase.rpc("match_accounts", {
+            "query_embedding": query_embedding,
+            "match_threshold": 0.2,
+            "match_count": top_n,
+            "filter_system": target_system
+        }).execute()
+        
+        return response.data if response.data else []
+    except Exception as e:
+        st.error(f"Fehler bei pgvector-Abfrage: {e}")
+        return []
 
-# --- MATHEMATISCHE PRÜF-ENGINE ---
+# ==============================================================================
+# MATHEMATISCHE PRÜF-ENGINE & UTILS
+# ==============================================================================
 def check_invoice_math(lines, invoice_totals):
     """Validiert die Grundrechenarten auf Positionsebene sowie die globalen Summen."""
     audit_trail = []
@@ -176,8 +177,8 @@ def check_invoice_math(lines, invoice_totals):
     status = "RECHNUNG ABGEWIESEN" if has_math_error else "RECHNERISCHE PRÜFUNG ERFOLGREICH"
     return status, audit_trail
 
-# --- PARSER & CORE LOGIK (CII & UBL) ---
 def parse_e_invoice_xml(xml_file):
+    """Extrahiert semantische Buchungsdaten aus CII und UBL XML-Strukturen."""
     tree = ET.parse(xml_file)
     root = tree.getroot()
     tag = root.tag
@@ -268,6 +269,7 @@ def parse_e_invoice_xml(xml_file):
         raise ValueError("Unbekanntes E-Rechnungsformat.")
 
 def get_ki_kontierung(item, vendor_name, gefilterte_optionen):
+    """Generiert eine strukturierte, regelbasierte Vorkontierung via LLM."""
     bereinigte_optionen = []
     for opt in gefilterte_optionen:
         bereinigte_optionen.append({
@@ -280,7 +282,7 @@ def get_ki_kontierung(item, vendor_name, gefilterte_optionen):
         "Du bist ein extrem pingeliger, konservativer deutscher Finanzbuchhalter.\n"
         "Deine Aufgabe ist es, die Position exakt und ohne kreative Auslegung auf den bereitgestellten Kontenrahmen zu kontieren.\n\n"
         "STRIKTE REGELN FÜR DEINE ENTSCHEIDUNG:\n"
-        "1. Physische oder digitale Bücher, Fachliteratur und Dokumentationen sind ZWINGEND als Fachliteratur/Bücher (z.B. 4940, 482000 oder 53100) zu kontieren.\n"
+        "1. Physische oder digitale Bücher, Fachliteratur und Dokumentationen sind ZWINGEND als Fachliteratur/Bücher (z.B. 4940) zu kontieren.\n"
         "2. IT-Entwicklung, Programmierung oder Projektarbeit von externen Freelancern sind Kern-Fremdleistungen.\n"
         "3. Wähle das Konto, dessen Beschreibung primär und direkt den Belegtext trifft. Keine logischen Brücken bauen.\n\n"
         "Antworte AUSSCHLIESSLICH als JSON-Objekt:\n"
@@ -296,15 +298,8 @@ def get_ki_kontierung(item, vendor_name, gefilterte_optionen):
     )
     return json.loads(response.choices[0].message.content)
 
-def validate_kontierung(ki_res, current_accounts):
-    vorgeschlagenes_konto = ki_res.get("konto_soll")
-    gueltige_konten = [k["konto"] for k in current_accounts]
-    if vorgeschlagenes_konto not in gueltige_konten:
-        return False, f"Konto {vorgeschlagenes_konto} ist im gewählten Stamm nicht existent."
-    return True, "APPROVED"
-
 def create_datev_csv(export_data):
-    """Erzeugt einen DATEV-konformen EXTF-Buchungsstapel."""
+    """Erzeugt einen validen DATEV-konformen EXTF-Buchungsstapel."""
     output = io.StringIO()
     output.write("EXTF;700;1;Buchungsstapel;;1;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n")
     output.write("Umsatz;Soll/Haben;Konto;Gegenkonto;BU-Schlüssel;Buchungstext\n")
@@ -335,16 +330,15 @@ def extract_xml_from_zugferd(pdf_file):
     return None
 
 def on_erp_system_change():
-    """Wird getriggert, wenn der Nutzer das ERP-System umschaltet."""
     if "processing_cache" in st.session_state:
         del st.session_state["processing_cache"]
     if "current_file" in st.session_state:
         del st.session_state["current_file"]
     st.session_state["demo_active"] = False
 
-# --- UI LAYOUT ---
-analytics_active = HAS_ANALYTICS
-
+# ==============================================================================
+# UI RUNTIME LAYOUT
+# ==============================================================================
 if HAS_ANALYTICS:
     try:
         cloud_password = st.secrets.get("ANALYTICS_PASSWORD", "lokal_dummy_pass")
@@ -360,22 +354,21 @@ else:
 
 with analytics_context:
     st.title("📊 Autonome E-Rechnungs-Engine")
-    st.subheader("Cross-Platform Multi-ERP Routing Engine für Corporate Governance")
+    st.subheader("Multi-ERP Routing Engine mit pgvector Ledger & Multi-Tenancy Isolation")
 
-    # --- SYSTEM AUSWAHL ---
-    target_system = st.radio(
-        "🎯 Wählen Sie das Ziel-ERP / Rechnungslegungssystem für das automatische Routing:",
+    # --- GOVERNANCE CONTROL CENTER (SIDEBAR) ---
+    st.sidebar.header("🏢 Mandanten-Governance")
+    current_tenant = st.sidebar.selectbox(
+        "Aktiver Unternehmens-Mandant (Data Isolation):",
+        options=["DE-Mittelstand-GmbH", "FR-Holding-SAS", "Rosenheim-Tech-KG"]
+    )
+    
+    st.sidebar.markdown("---")
+    target_system = st.sidebar.radio(
+        "🎯 Ziel-ERP / Rechnungslegung:",
         ["DATEV (SKR03)", "SAP (YCOA)", "Kameralistik (Kommune)"],
-        horizontal=True,
         on_change=on_erp_system_change
     )
-
-    ACTIVE_KONTENSTAMM = load_chart_of_accounts_by_system(target_system)
-
-    with st.sidebar:
-        st.header(f"Stammdaten: {target_system}")
-        df_visual = pd.DataFrame(ACTIVE_KONTENSTAMM)[["konto", "bezeichnung", "beschreibung"]]
-        st.dataframe(df_visual, use_container_width=True)
 
     if "demo_active" not in st.session_state:
         st.session_state["demo_active"] = False
@@ -424,7 +417,7 @@ with analytics_context:
     if xml_source is not None:
         try:
             vendor, lines, totals = parse_e_invoice_xml(xml_source)
-            st.success(f"Rechnung erfolgreich eingelesen! **Kreditor:** {vendor}")
+            st.success(f"Rechnung erfolgreich eingelesen! **Kreditor:** {vendor} | **Mandant:** {current_tenant}")
             
             # --- SCHRITT 1: FORMALE & RECHNERISCHE PRÜFUNG ---
             st.write("### 🧮 Schritt 1: Formale & Rechnerische Feststellung")
@@ -442,112 +435,109 @@ with analytics_context:
                 st.error("⚠️ KI-Verarbeitung gestoppt aufgrund formaler Rechnungsfehler.")
                 st.stop()
                 
-            # --- SCHRITT 2: KI KONTIERUNG & INTERAKTIVES OVERRIDE ---
-            st.write(f"### 🤖 Schritt 2: Extrahierte Positionen & KI-Routing nach {target_system}")
-            st.info("💡 **Motto: Fachexperte schlägt KI.** Jedes vorgeschlagene Konto kann über das Dropdown-Feld manuell überschrieben werden. Das System lernt aktiv mit.")
+            # --- SCHRITT 2: KI KONTIERUNG VIA PGVECTOR & INTERAKTIVES OVERRIDE ---
+            st.write("### 🤖 Schritt 2: Extrahierte Positionen & KI-Routing")
+            st.info("💡 **Fachexperte schlägt KI:** Manuelle Korrekturen werden persistent im Cloud-Wissensspeicher des Mandanten abgelegt.")
             
             # Cache initialisieren und KI-Analyse EINMALIG pro Beleg ausführen
             if "processing_cache" not in st.session_state or st.session_state.get("current_file") != file_name_label:
                 st.session_state["processing_cache"] = []
                 st.session_state["current_file"] = file_name_label
                 
-                with st.spinner("RAG-Engine sucht passende Konten via Semantik & KI analysiert..."):
+                with st.spinner("Führe pgvector-Ähnlichkeitssuche auf Cloud-Kontenrahmen aus..."):
                     for item in lines:
-                        gefilterte_konten = get_relevant_accounts(item["description"], ACTIVE_KONTENSTAMM, top_n=3)
-                        top_score = gefilterte_konten[0]["similarity_score"]
+                        # Aufruf des optimierten pgvector-Suchen-Verfahrens direkt in Supabase
+                        gefilterte_konten = get_relevant_accounts_pgvector(item["description"], target_system, top_n=3)
                         
-                        ki_res = get_ki_kontierung(item, vendor, gefilterte_konten)
-                        is_valid, msg = validate_kontierung(ki_res, ACTIVE_KONTENSTAMM)
+                        if gefilterte_konten:
+                            top_score = gefilterte_konten[0]["similarity_score"]
+                            ki_res = get_ki_kontierung(item, vendor, gefilterte_konten)
+                        else:
+                            top_score = 0.0
+                            ki_res = {"konto_soll": 9999, "begruendung": "Keine passenden Stammkonten via Vektor-Abfrage gefunden. Fallback aktiv."}
                         
                         item_key = f"{file_name_label} | Pos {item['id']}: {item['description']}"
                         
-                        # 🏛️ COMPLIANCE-LOG: Den initialen KI-Vorschlag atomar in PostgreSQL sichern (Version 1)
-                        if is_valid:
-                            log_audit_event(
-                                item_key=item_key,
-                                event_type="AI_PROPOSAL",
-                                konto_soll=ki_res["konto_soll"],
-                                actor="AI-Agent (gpt-4o-mini)",
-                                justification=ki_res.get("begruendung", "Automatische Vorkontierung via RAG-Kontext.")
-                            )
+                        # 🏛️ COMPLIANCE-LOG: Initialen KI-Vorschlag atomar für diesen Mandanten sichern (Version 1)
+                        log_audit_event(
+                            company_id=current_tenant,
+                            item_key=item_key,
+                            event_type="AI_PROPOSAL",
+                            konto_soll=ki_res["konto_soll"],
+                            actor="AI-Agent (gpt-4o-mini)",
+                            justification=ki_res.get("begruendung", "Automatische Vorkontierung via pgvector-RPC.")
+                        )
                         
                         st.session_state["processing_cache"].append({
                             "item": item,
                             "ki_res": ki_res,
-                            "is_valid": is_valid,
-                            "msg": msg,
                             "confidence_score": top_score,
-                            "gefilterte_konten": gefilterte_konten,
-                            "db_logged_initial": True
+                            "gefilterte_konten": gefilterte_konten
                         })
-
-            available_accounts = [k["konto"] for k in ACTIVE_KONTENSTAMM]
-            account_labels = {k["konto"]: f"{k['konto']} - {k['bezeichnung']}" for k in ACTIVE_KONTENSTAMM}
-            user_overrides = load_user_overrides()
 
             validierte_buchungen_liste = []
             
             for index, cached_item in enumerate(st.session_state["processing_cache"]):
                 item = cached_item["item"]
                 ki_res = cached_item["ki_res"]
-                is_valid = cached_item["is_valid"]
-                msg = cached_item["msg"]
                 opt = cached_item["gefilterte_konten"]
                 score = cached_item.get("confidence_score", 0.0)
                 
                 text_key = item["description"]
                 ai_acc = ki_res.get("konto_soll")
                 
-                has_history = text_key in user_overrides
-                default_account = user_overrides[text_key] if has_history else ai_acc
+                # Mandantenabhängige Prüfung historischer Benutzer-Entscheidungen aus Supabase
+                db_history_account = load_user_override_from_db(current_tenant, text_key)
+                has_history = db_history_account is not None
+                default_account = db_history_account if has_history else ai_acc
                 
-                if isinstance(default_account, str) and default_account.isdigit():
-                    default_account = int(default_account)
-                
+                # Fallback für Selectbox-Sicherheit aufbauen
+                available_accounts = [k["konto"] for k in opt] if opt else [9999]
                 if default_account not in available_accounts:
-                    default_account = available_accounts[0] if available_accounts else ai_acc
+                    available_accounts.insert(0, default_account)
                 
+                account_labels = {k["konto"]: f"{k['konto']} - {k['bezeichnung']}" for k in opt} if opt else {9999: "Fallback-Konto"}
+                if default_account not in account_labels:
+                    account_labels[default_account] = f"{default_account} - (Vorschlag/Historie)"
+
                 with st.container():
                     col1, col2, col3 = st.columns([3, 2, 3])
                     with col1:
                         st.markdown(f"**Pos {item['id']}:** {item['description']}")
-                        st.caption(f"Netto-Betrag: {item['amount']:.2f} EUR | 📝 Steuersatz: {item['tax_percent']}%")
-                        st.caption(f"💡 *RAG-Vektor-Top-3: {', '.join([str(k['konto']) for k in opt])}*")
+                        st.caption(f"Netto: {item['amount']:.2f} EUR | 📝 MwSt: {item['tax_percent']}%")
+                        if opt:
+                            st.caption(f"💡 *pgvector-Top-3: {', '.join([str(k['konto']) for k in opt])}*")
                     
                     with col2:
-                        if not is_valid:
-                            st.error(f"Fehler: {msg}")
-                            selected_acc = ai_acc
-                            protokoll = f"Ungültige KI-Rückgabe: {msg}"
+                        selected_acc = st.selectbox(
+                            f"Ziel-Konto anpassen (Pos {item['id']}):",
+                            options=available_accounts,
+                            index=available_accounts.index(default_account),
+                            format_func=lambda x: account_labels.get(x, str(x)),
+                            key=f"select_pos_{item['id']}_{index}"
+                        )
+                        
+                        if selected_acc != ai_acc:
+                            if has_history and selected_acc == db_history_account:
+                                protokoll = f"Historisches Mandanten-Wissen genutzt (KI empfahl {ai_acc})"
+                            else:
+                                protokoll = f"Manuell korrigiert (KI empfahl {ai_acc} mit Conf {score:.2f})"
+                                # Permanent und mandantenisoliert in der Cloud sichern
+                                if db_history_account != selected_acc:
+                                    save_user_override_to_db(current_tenant, text_key, selected_acc)
                         else:
-                            selected_acc = st.selectbox(
-                                f"Ziel-Konto anpassen (Pos {item['id']}):",
-                                options=available_accounts,
-                                index=available_accounts.index(default_account) if default_account in available_accounts else 0,
-                                format_func=lambda x: account_labels.get(x, str(x)),
-                                key=f"select_pos_{item['id']}_{index}"
-                            )
-                            
-                            if selected_acc != ai_acc:
-                                if has_history and selected_acc == user_overrides[text_key]:
-                                    protokoll = f"Historisches User-Konto genutzt (KI empfahl ursprünglich {ai_acc})"
-                                else:
-                                    protokoll = f"Manuell korrigiert (KI empfahl {ai_acc} mit Conf {score:.2f})"
-                                    if text_key not in user_overrides or user_overrides[text_key] != selected_acc:
-                                        save_user_override(text_key, selected_acc)
-                            else:
-                                if has_history:
-                                    protokoll = f"Historisches User-Konto genutzt (Identisch mit KI-Vorschlag)"
-                                else:
-                                    protokoll = f"Automatisch kontiert via KI (Conf: {score:.2f})"
-                            
                             if has_history:
-                                st.success("🔄 Historisch gelernt")
-                            elif score >= 0.35:
-                                st.success(f"🟢 KI Sicher")
+                                protokoll = f"Historisches Mandanten-Wissen genutzt (Identisch mit KI-Vorschlag)"
                             else:
-                                st.warning(f"🟡 Prüfung empfohlen")
-                                
+                                protokoll = f"Automatisch kontiert via KI (Conf: {score:.2f})"
+                        
+                        if has_history:
+                            st.success("🔄 Gelernt (Cloud DB)")
+                        elif score >= 0.35:
+                            st.success(f"🟢 KI Sicher")
+                        else:
+                            st.warning(f"🟡 Prüfung empfohlen")
+                            
                         validierte_buchungen_liste.append({
                             "netto": item['amount'],
                             "konto_soll": selected_acc,
@@ -560,7 +550,7 @@ with analytics_context:
                     
                     with col3:
                         st.text_area("KI-Originalbegründung (Read-Only)", value=ki_res.get('begruendung', ''), key=f"text_{item['id']}_{index}", height=68, disabled=True)
-                st.divider()  
+                st.markdown("<br>", unsafe_allow_html=True)
             
             # --- SCHRITT 3: COMPLIANCE EXPORT & AUDIT TRAIL ---
             if validierte_buchungen_liste:
@@ -571,27 +561,26 @@ with analytics_context:
                 st.write("#### 📋 Vorschau der zu exportierenden Buchungssätze:")
                 st.dataframe(df_export, use_container_width=True)
                 
-                # Zwei Buttons trennen: "In DB festschreiben" sichert Revisionskonformität vor dem finalen CSV-Download
                 if st.button("Prozess finalisieren & Audit-Logs in Cloud sichern", use_container_width=True, type="primary"):
                     with st.spinner("Synchronisiere immutable Ledger mit PostgreSQL..."):
                         for row in validierte_buchungen_liste:
-                            # Falls eine Abweichung vorliegt, hängen wir das USER_OVERRIDE-Event an (erzeugt Version 2 in DB)
                             if row["konto_soll"] != row["ki_original_acc"]:
                                 log_audit_event(
+                                    company_id=current_tenant,
                                     item_key=f"{file_name_label} | Pos {row['beschreibung']}",
                                     event_type="USER_OVERRIDE",
                                     konto_soll=row["konto_soll"],
                                     actor="Fachexperte (UI)",
                                     justification=row["audit_trail"]
                                 )
-                        st.success("✅ Sämtliche Zustandsänderungen wurden revisionssicher im PostgreSQL-Ledger festgeschrieben (GoBD-konform).")
+                        st.success(f"✅ Sämtliche Zustandsänderungen wurden für den Mandanten '{current_tenant}' revisionssicher im PostgreSQL-Ledger festgeschrieben.")
                 
                 if "DATEV" in target_system:
                     datev_csv_content = create_datev_csv(validierte_buchungen_liste)
                     st.download_button(
                         label="📥 Export nach DATEV (EXTF) herunterladen",
                         data=datev_csv_content,
-                        file_name="DATEV_Buchungsstapel_Export.csv",
+                        file_name=f"DATEV_EXTF_{current_tenant}.csv",
                         mime="text/csv",
                         use_container_width=True
                     )
@@ -602,7 +591,7 @@ with analytics_context:
                     st.download_button(
                         label=f"📥 Export für {target_system} herunterladen",
                         data=csv_buffer.getvalue(),
-                        file_name=f"{target_system.replace(' ', '_')}_Export.csv",
+                        file_name=f"{target_system.replace(' ', '_')}_{current_tenant}.csv",
                         mime="text/csv",
                         use_container_width=True
                     )
