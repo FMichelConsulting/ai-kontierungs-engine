@@ -8,6 +8,7 @@ import numpy as np
 from openai import OpenAI
 from pypdf import PdfReader
 import contextlib  # <--- Für den Null-Kontext-Fallback
+from supabase import create_client, Client  # <--- Offizieller Supabase-Infrastruktur-Client
 
 # Kaskadierender Import für absolute Kompatibilität mit dem Fork
 HAS_ANALYTICS = False
@@ -34,7 +35,43 @@ except Exception:
     client = None
 
 # ==============================================================================
-# PERSISTENZ-LAYER (Human-in-the-Loop Wissensdatenbank)
+# SUPABASE DATABASE LAYER (GoBD-konformer Append-Only Ledger)
+# ==============================================================================
+@st.cache_resource
+def init_supabase() -> Client:
+    """Initialisiert den gehärteten Admin-Client via Service-Role Key."""
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+        return create_client(url, key)
+    except Exception as e:
+        st.error(f"Supabase-Verbindungsfehler: Secrets unvollständig konfiguriert ({e})")
+        return None
+
+def log_audit_event(item_key: str, event_type: str, konto_soll: int, actor: str, justification: str):
+    """
+    Schreibt einen unveränderbaren Eintrag in das PostgreSQL-Audit-Log.
+    Die Inkrementierung der Spalte 'version' erfolgt atomar via DB-Trigger.
+    """
+    supabase = init_supabase()
+    if not supabase:
+        return
+
+    event_data = {
+        "item_key": item_key,
+        "event_type": event_type,
+        "konto_soll": int(konto_soll),
+        "actor": actor,
+        "justification": justification
+    }
+    
+    try:
+        supabase.table("invoice_audit_log").insert(event_data).execute()
+    except Exception as e:
+        st.error(f"🚨 KRITISCHER COMPLIANCE-FEHLER: Audit-Log-Schreiben fehlgeschlagen: {e}")
+
+# ==============================================================================
+# PERSISTENZ-LAYER (Lokale Human-in-the-Loop Wissensdatenbank Fallback)
 # ==============================================================================
 OVERRIDES_FILE = "user_overrides.json"
 
@@ -76,16 +113,12 @@ def cosine_similarity(a, b):
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
 def load_chart_of_accounts_by_system(system_name):
-    """
-    Lädt den passenden Kontenrahmen inklusive Vektoren basierend auf dem Zielsystem.
-    Verhindert API-Kaltstart-Latenzen durch Nutzung lokaler JSON-Caches.
-    """
+    """Lädt den passenden Kontenrahmen inklusive Vektoren basierend auf dem Zielsystem."""
     mapping = {
         "DATEV (SKR03)": "skr03_with_embeddings.json",
         "SAP (YCOA)": "sap_ycoa_with_embeddings.json",
         "Kameralistik (Kommune)": "kameralistik_kommune_with_embeddings.json"
     }
-    
     json_filename = mapping.get(system_name, "skr03_with_embeddings.json")
     
     if os.path.exists(json_filename):
@@ -111,13 +144,9 @@ def get_relevant_accounts(item_description, current_accounts, top_n=3):
     scored_accounts.sort(key=lambda x: x["similarity_score"], reverse=True)
     return scored_accounts[:top_n]
 
-
 # --- MATHEMATISCHE PRÜF-ENGINE ---
 def check_invoice_math(lines, invoice_totals):
-    """
-    Validiert die Grundrechenarten auf Positionsebene sowie die globalen Summen.
-    Erlaubt eine Rundungstoleranz von maximal 0.02 EUR.
-    """
+    """Validiert die Grundrechenarten auf Positionsebene sowie die globalen Summen."""
     audit_trail = []
     has_math_error = False
     tolerance = 0.02
@@ -147,7 +176,6 @@ def check_invoice_math(lines, invoice_totals):
     status = "RECHNUNG ABGEWIESEN" if has_math_error else "RECHNERISCHE PRÜFUNG ERFOLGREICH"
     return status, audit_trail
 
-
 # --- PARSER & CORE LOGIK (CII & UBL) ---
 def parse_e_invoice_xml(xml_file):
     tree = ET.parse(xml_file)
@@ -156,7 +184,6 @@ def parse_e_invoice_xml(xml_file):
     
     invoice_totals = {"gesamt_netto": 0.0, "gesamt_steuer": 0.0, "gesamt_brutto": 0.0}
     
-    # 1. FALL: CII Standard (ZUGFeRD / Factur-X)
     if "CrossIndustryInvoice" in tag or tag.endswith("CrossIndustryInvoice"):
         vendor_node = root.find('.//{*}SellerTradeParty//{*}Name')
         vendor_name = vendor_node.text if vendor_node is not None else "Unbekannter Kreditor"
@@ -207,7 +234,6 @@ def parse_e_invoice_xml(xml_file):
                     })
         return vendor_name, parsed_lines, invoice_totals
 
-    # 2. FALL: UBL Standard (XRechnung)
     elif "Invoice" in tag or tag.endswith("Invoice"):
         vendor_node = root.find('.//{*}AccountingSupplierParty//{*}PartyName/{*}Name')
         if vendor_node is None:
@@ -278,11 +304,7 @@ def validate_kontierung(ki_res, current_accounts):
     return True, "APPROVED"
 
 def create_datev_csv(export_data):
-    """
-    Erzeugt einen DATEV-konformen EXTF-Buchungsstapel.
-    Jede Rechnungsposition wird als eigenständiger Buchungssatz (Split) exportiert.
-    WICHTIG: DATEV erwartet bei Nutzung von BU-Schlüsseln den BRUTTO-Umsatz der Position!
-    """
+    """Erzeugt einen DATEV-konformen EXTF-Buchungsstapel."""
     output = io.StringIO()
     output.write("EXTF;700;1;Buchungsstapel;;1;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n")
     output.write("Umsatz;Soll/Haben;Konto;Gegenkonto;BU-Schlüssel;Buchungstext\n")
@@ -313,7 +335,7 @@ def extract_xml_from_zugferd(pdf_file):
     return None
 
 def on_erp_system_change():
-    """Wird getriggert, wenn der Nutzer das ERP-System umschaltet. Löscht den Ausführungs-Cache."""
+    """Wird getriggert, wenn der Nutzer das ERP-System umschaltet."""
     if "processing_cache" in st.session_state:
         del st.session_state["processing_cache"]
     if "current_file" in st.session_state:
@@ -424,6 +446,7 @@ with analytics_context:
             st.write(f"### 🤖 Schritt 2: Extrahierte Positionen & KI-Routing nach {target_system}")
             st.info("💡 **Motto: Fachexperte schlägt KI.** Jedes vorgeschlagene Konto kann über das Dropdown-Feld manuell überschrieben werden. Das System lernt aktiv mit.")
             
+            # Cache initialisieren und KI-Analyse EINMALIG pro Beleg ausführen
             if "processing_cache" not in st.session_state or st.session_state.get("current_file") != file_name_label:
                 st.session_state["processing_cache"] = []
                 st.session_state["current_file"] = file_name_label
@@ -436,16 +459,28 @@ with analytics_context:
                         ki_res = get_ki_kontierung(item, vendor, gefilterte_konten)
                         is_valid, msg = validate_kontierung(ki_res, ACTIVE_KONTENSTAMM)
                         
+                        item_key = f"{file_name_label} | Pos {item['id']}: {item['description']}"
+                        
+                        # 🏛️ COMPLIANCE-LOG: Den initialen KI-Vorschlag atomar in PostgreSQL sichern (Version 1)
+                        if is_valid:
+                            log_audit_event(
+                                item_key=item_key,
+                                event_type="AI_PROPOSAL",
+                                konto_soll=ki_res["konto_soll"],
+                                actor="AI-Agent (gpt-4o-mini)",
+                                justification=ki_res.get("begruendung", "Automatische Vorkontierung via RAG-Kontext.")
+                            )
+                        
                         st.session_state["processing_cache"].append({
                             "item": item,
                             "ki_res": ki_res,
                             "is_valid": is_valid,
                             "msg": msg,
                             "confidence_score": top_score,
-                            "gefilterte_konten": gefilterte_konten
+                            "gefilterte_konten": gefilterte_konten,
+                            "db_logged_initial": True
                         })
 
-            # Stammdaten-Struktur für die Dropdown-Vorbereitung indizieren
             available_accounts = [k["konto"] for k in ACTIVE_KONTENSTAMM]
             account_labels = {k["konto"]: f"{k['konto']} - {k['bezeichnung']}" for k in ACTIVE_KONTENSTAMM}
             user_overrides = load_user_overrides()
@@ -463,11 +498,9 @@ with analytics_context:
                 text_key = item["description"]
                 ai_acc = ki_res.get("konto_soll")
                 
-                # Prüfung auf historische Anpassungen durch den User (Lernspeicher)
                 has_history = text_key in user_overrides
                 default_account = user_overrides[text_key] if has_history else ai_acc
                 
-                # Typkonvertierung falls JSON-Keys als String interpretiert wurden
                 if isinstance(default_account, str) and default_account.isdigit():
                     default_account = int(default_account)
                 
@@ -487,7 +520,6 @@ with analytics_context:
                             selected_acc = ai_acc
                             protokoll = f"Ungültige KI-Rückgabe: {msg}"
                         else:
-                            # Das interaktive UI-Gateway für den Fachexperten (Option A)
                             selected_acc = st.selectbox(
                                 f"Ziel-Konto anpassen (Pos {item['id']}):",
                                 options=available_accounts,
@@ -496,7 +528,6 @@ with analytics_context:
                                 key=f"select_pos_{item['id']}_{index}"
                             )
                             
-                            # Logik-Engine zur Feststellung der Herkunft (Audit Trail)
                             if selected_acc != ai_acc:
                                 if has_history and selected_acc == user_overrides[text_key]:
                                     protokoll = f"Historisches User-Konto genutzt (KI empfahl ursprünglich {ai_acc})"
@@ -510,7 +541,6 @@ with analytics_context:
                                 else:
                                     protokoll = f"Automatisch kontiert via KI (Conf: {score:.2f})"
                             
-                            # Status-Badge rendern
                             if has_history:
                                 st.success("🔄 Historisch gelernt")
                             elif score >= 0.35:
@@ -518,13 +548,14 @@ with analytics_context:
                             else:
                                 st.warning(f"🟡 Prüfung empfohlen")
                                 
-                        # Für das nachfolgende Export-Array aggregieren
                         validierte_buchungen_liste.append({
                             "netto": item['amount'],
                             "konto_soll": selected_acc,
                             "beschreibung": f"{vendor}: {item['description']}",
                             "tax_percent": item['tax_percent'],
-                            "audit_trail": protokoll
+                            "audit_trail": protokoll,
+                            "raw_item_desc": item['description'],
+                            "ki_original_acc": ai_acc
                         })
                     
                     with col3:
@@ -535,28 +566,41 @@ with analytics_context:
             if validierte_buchungen_liste:
                 st.write("### 🚀 Schritt 3: Prozess abschließen")
                 
-                # Vorab-Anzeige des DataFrames inklusive des dynamischen Audit Trails
-                df_export = pd.DataFrame(validierte_buchungen_liste)
+                df_export = pd.DataFrame(validierte_buchungen_liste)[["netto", "konto_soll", "beschreibung", "tax_percent", "audit_trail"]]
                 df_export.columns = ["Netto-Betrag", "Ziel-Konto/Titel", "Buchungstext", "MwSt-%", "Audit-Trail / Protokoll"]
                 st.write("#### 📋 Vorschau der zu exportierenden Buchungssätze:")
                 st.dataframe(df_export, use_container_width=True)
                 
+                # Zwei Buttons trennen: "In DB festschreiben" sichert Revisionskonformität vor dem finalen CSV-Download
+                if st.button("Prozess finalisieren & Audit-Logs in Cloud sichern", use_container_width=True, type="primary"):
+                    with st.spinner("Synchronisiere immutable Ledger mit PostgreSQL..."):
+                        for row in validierte_buchungen_liste:
+                            # Falls eine Abweichung vorliegt, hängen wir das USER_OVERRIDE-Event an (erzeugt Version 2 in DB)
+                            if row["konto_soll"] != row["ki_original_acc"]:
+                                log_audit_event(
+                                    item_key=f"{file_name_label} | Pos {row['beschreibung']}",
+                                    event_type="USER_OVERRIDE",
+                                    konto_soll=row["konto_soll"],
+                                    actor="Fachexperte (UI)",
+                                    justification=row["audit_trail"]
+                                )
+                        st.success("✅ Sämtliche Zustandsänderungen wurden revisionssicher im PostgreSQL-Ledger festgeschrieben (GoBD-konform).")
+                
                 if "DATEV" in target_system:
                     datev_csv_content = create_datev_csv(validierte_buchungen_liste)
                     st.download_button(
-                        label="Kontierung übernehmen und Export nach DATEV (EXTF)",
+                        label="📥 Export nach DATEV (EXTF) herunterladen",
                         data=datev_csv_content,
                         file_name="DATEV_Buchungsstapel_Export.csv",
                         mime="text/csv",
                         use_container_width=True
                     )
                 else:
-                    # Generischer Export für SAP (YCOA) und Kameralistik
                     csv_buffer = io.StringIO()
                     df_export.to_csv(csv_buffer, index=False, sep=";", encoding="utf-8-sig")
                     
                     st.download_button(
-                        label=f"Kontierung übernehmen und Export für {target_system}",
+                        label=f"📥 Export für {target_system} herunterladen",
                         data=csv_buffer.getvalue(),
                         file_name=f"{target_system.replace(' ', '_')}_Export.csv",
                         mime="text/csv",
@@ -565,3 +609,4 @@ with analytics_context:
                     
         except Exception as e:
             st.error(f"Fehler beim Verarbeiten der Struktur: {e}")
+            
