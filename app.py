@@ -35,11 +35,11 @@ except Exception:
     client = None
 
 # ==============================================================================
-# SUPABASE ENTERPRISE DATABASE LAYER (Mandantenfähig & pgvector-gestützt)
+# SUPABASE BASE CLIENT INITIALIZATION
 # ==============================================================================
 @st.cache_resource
 def init_supabase() -> Client:
-    """Initialisiert den gehärteten Admin-Client via Service-Role Key."""
+    """Initialisiert den Basiskommunikations-Client über den Service-Key."""
     try:
         url = st.secrets["SUPABASE_URL"]
         key = st.secrets["SUPABASE_KEY"]
@@ -48,62 +48,83 @@ def init_supabase() -> Client:
         st.error(f"Supabase-Verbindungsfehler: Secrets unvollständig konfiguriert ({e})")
         return None
 
-def log_audit_event(company_id: str, item_key: str, event_type: str, konto_soll: int, actor: str, justification: str):
-    """
-    Schreibt einen unveränderbaren Eintrag inklusive Mandanten-ID in das PostgreSQL-Audit-Log.
-    Die Inkrementierung der Spalte 'version' erfolgt atomar via DB-Trigger.
-    """
-    supabase = init_supabase()
-    if not supabase:
-        return
-
-    event_data = {
-        "company_id": company_id,
-        "item_key": item_key,
-        "event_type": event_type,
-        "konto_soll": int(konto_soll),
-        "actor": actor,
-        "justification": justification
-    }
-    
-    try:
-        supabase.table("invoice_audit_log").insert(event_data).execute()
-    except Exception as e:
-        st.error(f"🚨 KRITISCHER COMPLIANCE-FEHLER: Audit-Log-Schreiben fehlgeschlagen: {e}")
-
-def load_user_override_from_db(company_id: str, buchungstext: str) -> int:
-    """Lädt die historische Korrektur für einen spezifischen Mandanten aus PostgreSQL."""
-    supabase = init_supabase()
-    if not supabase:
-        return None
-    try:
-        res = supabase.table("user_knowledge_base")\
-            .select("konto_soll")\
-            .eq("company_id", company_id)\
-            .eq("buchungstext", buchungstext)\
-            .maybe_single()\
-            .execute()
-        return res.data["konto_soll"] if res.data else None
-    except Exception:
-        return None
-
-def save_user_override_to_db(company_id: str, buchungstext: str, korrigiertes_konto: int):
-    """Speichert eine manuelle Korrektur permanent und mandantenabhängig via SQL-Upsert."""
-    supabase = init_supabase()
-    if not supabase:
-        return
-    payload = {
-        "company_id": company_id,
-        "buchungstext": buchungstext,
-        "konto_soll": int(korrigiertes_konto)
-    }
-    try:
-        supabase.table("user_knowledge_base").upsert(payload, on_conflict="company_id,buchungstext").execute()
-    except Exception as e:
-        st.error(f"Fehler beim Speichern des Cloud-Overrides: {e}")
 
 # ==============================================================================
-# HARDENED RAG-RETRIEVER VIA PGVECTOR
+# ENCAPSULATED DATA ACCESS LAYER (Tenant Isolation Architecture)
+# ==============================================================================
+class TenantRepository:
+    """
+    Kapselt den Datenbankzugriff und erzwingt die Mandantentrennung auf Applikationsebene.
+    Verhindert strukturell das Vergessen von company_id-Filtern im App-Code.
+    """
+    def __init__(self, supabase_client: Client, company_id: str):
+        if not company_id:
+            raise ValueError("Security Alert: Initialisierung verweigert. company_id fehlt.")
+        self._client = supabase_client
+        self.company_id = company_id
+
+    def log_audit_event(self, item_key: str, event_type: str, konto_soll: int, actor: str, justification: str):
+        """Schreibt einen unveränderbaren Eintrag mit der gekapselten Mandanten-ID ins Log."""
+        event_data = {
+            "company_id": self.company_id,
+            "item_key": item_key,
+            "event_type": event_type,
+            "konto_soll": int(konto_soll),
+            "actor": actor,
+            "justification": justification
+        }
+        try:
+            self._client.table("invoice_audit_log").insert(event_data).execute()
+        except Exception as e:
+            st.error(f"🚨 KRITISCHER COMPLIANCE-FEHLER: Audit-Log-Schreiben fehlgeschlagen: {e}")
+
+    def load_user_override(self, buchungstext: str) -> int:
+        """Lädt die historische Korrektur isoliert für den aktuellen Mandanten."""
+        try:
+            res = self._client.table("user_knowledge_base")\
+                .select("konto_soll")\
+                .eq("company_id", self.company_id)\
+                .eq("buchungstext", buchungstext)\
+                .maybe_single()\
+                .execute()
+            return res.data["konto_soll"] if res.data else None
+        except Exception:
+            return None
+
+    def save_user_override(self, buchungstext: str, korrigiertes_konto: int):
+        """Sichert eine manuelle Korrektur als atomares, mandantenspezifisches Upsert."""
+        payload = {
+            "company_id": self.company_id,
+            "buchungstext": buchungstext,
+            "konto_soll": int(korrigiertes_konto)
+        }
+        try:
+            self._client.table("user_knowledge_base").upsert(payload, on_conflict="company_id,buchungstext").execute()
+        except Exception as e:
+            st.error(f"Fehler beim Speichern des Cloud-Overrides: {e}")
+
+    def get_relevant_accounts_pgvector(self, item_description: str, target_system: str, top_n=3):
+        """Führt eine pgvector-Suche im Kontext des initialisierten Basis-Clients aus."""
+        query_embedding = get_embedding(item_description)
+        if not query_embedding:
+            return []
+            
+        try:
+            response = self._client.rpc("match_accounts", {
+                "query_embedding": query_embedding,
+                "match_threshold": 0.2,
+                "match_count": top_n,
+                "filter_system": target_system
+            }).execute()
+            
+            return response.data if response.data else []
+        except Exception as e:
+            st.error(f"Fehler bei pgvector-Abfrage: {e}")
+            return []
+
+
+# ==============================================================================
+# HARDENED RAG-RETRIEVER UTILS
 # ==============================================================================
 def get_embedding(text, model="text-embedding-3-small"):
     """Erzeugt einen semantischen Vektor für den Belegtext über die OpenAI-API."""
@@ -117,31 +138,6 @@ def get_embedding(text, model="text-embedding-3-small"):
         st.error(f"Fehler bei der Embedding-Generierung: {e}")
         return None
 
-def get_relevant_accounts_pgvector(item_description: str, target_system: str, top_n=3):
-    """
-    Nutzt die native pgvector-Erweiterung von PostgreSQL für eine 
-    hochperformante Ähnlichkeitssuche direkt in der Cloud-Datenbank.
-    """
-    supabase = init_supabase()
-    if not supabase:
-        return []
-        
-    query_embedding = get_embedding(item_description)
-    if not query_embedding:
-        return []
-        
-    try:
-        response = supabase.rpc("match_accounts", {
-            "query_embedding": query_embedding,
-            "match_threshold": 0.2,
-            "match_count": top_n,
-            "filter_system": target_system
-        }).execute()
-        
-        return response.data if response.data else []
-    except Exception as e:
-        st.error(f"Fehler bei pgvector-Abfrage: {e}")
-        return []
 
 # ==============================================================================
 # MATHEMATISCHE PRÜF-ENGINE & UTILS
@@ -336,8 +332,9 @@ def on_erp_system_change():
         del st.session_state["current_file"]
     st.session_state["demo_active"] = False
 
+
 # ==============================================================================
-# UI RUNTIME LAYOUT
+# UI RUNTIME LAYOUT & RUNTIME INITIALIZATION
 # ==============================================================================
 if HAS_ANALYTICS:
     try:
@@ -362,6 +359,16 @@ with analytics_context:
         "Aktiver Unternehmens-Mandant (Data Isolation):",
         options=["DE-Mittelstand-GmbH", "FR-Holding-SAS", "Rosenheim-Tech-KG"]
     )
+    
+    # --- INSTANTIATE REPOSITORY FACTORY WITHIN SESSION STATE ---
+    supabase_base = init_supabase()
+    if not supabase_base:
+        st.error("🚨 Kritischer Infrastrukturfehler: Supabase-Verbindung nicht verfügbar.")
+        st.stop()
+        
+    # Dynamischer Austausch des Repositories bei Mandanten-Wechsel im Session State
+    if "repo" not in st.session_state or st.session_state.repo.company_id != current_tenant:
+        st.session_state.repo = TenantRepository(supabase_base, current_tenant)
     
     st.sidebar.markdown("---")
     target_system = st.sidebar.radio(
@@ -446,8 +453,8 @@ with analytics_context:
                 
                 with st.spinner("Führe pgvector-Ähnlichkeitssuche auf Cloud-Kontenrahmen aus..."):
                     for item in lines:
-                        # Aufruf des optimierten pgvector-Suchen-Verfahrens direkt in Supabase
-                        gefilterte_konten = get_relevant_accounts_pgvector(item["description"], target_system, top_n=3)
+                        # Aufruf des optimierten pgvector-Suchen-Verfahrens über den DAL
+                        gefilterte_konten = st.session_state.repo.get_relevant_accounts_pgvector(item["description"], target_system, top_n=3)
                         
                         if gefilterte_konten:
                             top_score = gefilterte_konten[0]["similarity_score"]
@@ -458,9 +465,8 @@ with analytics_context:
                         
                         item_key = f"{file_name_label} | Pos {item['id']}: {item['description']}"
                         
-                        # 🏛️ COMPLIANCE-LOG: Initialen KI-Vorschlag atomar für diesen Mandanten sichern (Version 1)
-                        log_audit_event(
-                            company_id=current_tenant,
+                        # COMPLIANCE-LOG: Gekapselter Audit-Event Write (company_id wird intern injiziert)
+                        st.session_state.repo.log_audit_event(
                             item_key=item_key,
                             event_type="AI_PROPOSAL",
                             konto_soll=ki_res["konto_soll"],
@@ -486,8 +492,8 @@ with analytics_context:
                 text_key = item["description"]
                 ai_acc = ki_res.get("konto_soll")
                 
-                # Mandantenabhängige Prüfung historischer Benutzer-Entscheidungen aus Supabase
-                db_history_account = load_user_override_from_db(current_tenant, text_key)
+                # Mandantenabhängige Prüfung über gekapseltes Repository
+                db_history_account = st.session_state.repo.load_user_override(text_key)
                 has_history = db_history_account is not None
                 default_account = db_history_account if has_history else ai_acc
                 
@@ -522,9 +528,9 @@ with analytics_context:
                                 protokoll = f"Historisches Mandanten-Wissen genutzt (KI empfahl {ai_acc})"
                             else:
                                 protokoll = f"Manuell korrigiert (KI empfahl {ai_acc} mit Conf {score:.2f})"
-                                # Permanent und mandantenisoliert in der Cloud sichern
+                                # Sicheres Schreiben über gekapseltes Repository
                                 if db_history_account != selected_acc:
-                                    save_user_override_to_db(current_tenant, text_key, selected_acc)
+                                    st.session_state.repo.save_user_override(text_key, selected_acc)
                         else:
                             if has_history:
                                 protokoll = f"Historisches Mandanten-Wissen genutzt (Identisch mit KI-Vorschlag)"
@@ -565,8 +571,7 @@ with analytics_context:
                     with st.spinner("Synchronisiere immutable Ledger mit PostgreSQL..."):
                         for row in validierte_buchungen_liste:
                             if row["konto_soll"] != row["ki_original_acc"]:
-                                log_audit_event(
-                                    company_id=current_tenant,
+                                st.session_state.repo.log_audit_event(
                                     item_key=f"{file_name_label} | Pos {row['beschreibung']}",
                                     event_type="USER_OVERRIDE",
                                     konto_soll=row["konto_soll"],
@@ -598,4 +603,5 @@ with analytics_context:
                     
         except Exception as e:
             st.error(f"Fehler beim Verarbeiten der Struktur: {e}")
+
             
